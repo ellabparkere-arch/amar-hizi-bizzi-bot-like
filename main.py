@@ -134,4 +134,173 @@ HELP_TEXT = (
     "/removeauto <uid> — কোনো auto like টাস্ক মুছুন\n"
     "/stauto — Auto like process manual ভাবে এখনই চালু করুন (admin only)\n\n"
     "নোট: Auto like টাস্ক প্রতিদিন 7:00 AM Bangladesh Time (UTC+6) এ রান করে।\n"
-    "Extra: /extendauto <uid> <
+    "Extra: /extendauto <uid> <+/-days> — টাস্কের দিন বাড়ানো/কমানো (admin only)"
+)
+
+# ----------------------------
+# Commands
+# ----------------------------
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP_TEXT)
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP_TEXT)
+
+async def like_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text("ব্যবহার: /like <uid>\nউদাহরণ: /like 1234567890")
+        return
+    uid = args[0].strip()
+    ok, msg = call_like_api(uid)
+    if ok:
+        await update.message.reply_text(f"✅ Like sent to UID {uid}\nResponse: {msg}")
+    else:
+        await update.message.reply_text(f"❌ Failed for UID {uid}\nError: {msg}")
+
+async def auto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("এই কমান্ডটি শুধুমাত্র admin ব্যবহার করতে পারবে।")
+        return
+    args = context.args
+    if len(args) < 2 or not args[1].lstrip("-").isdigit():
+        await update.message.reply_text("ব্যবহার: /auto <uid> <days>\nউদাহরণ: /auto 8385763215 30")
+        return
+    uid = args[0].strip()
+    days = int(args[1])
+    if days <= 0:
+        await update.message.reply_text("days অবশ্যই 1 বা তার বেশি হতে হবে।")
+        return
+    upsert_task(uid, user_id, days)
+    await update.message.reply_text(f"✅ Auto like সেট হয়েছে: UID {uid}, {days} দিন। প্রতিদিন সকাল 7টা (BD) রান করবে।")
+
+async def myautos_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    rows = get_tasks_for_user(user_id)
+    if not rows:
+        await update.message.reply_text("আপনার কোনো active auto like টাস্ক নেই।")
+        return
+    lines = ["আপনার Auto Like টাস্ক:"]
+    for r in rows:
+        lines.append(f"• UID {r['uid']} — {r['days_remaining']} দিন বাকি (added: {r['created_at']})")
+    await update.message.reply_text("\n".join(lines))
+
+async def removeauto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text("ব্যবহার: /removeauto <uid>")
+        return
+    uid = args[0].strip()
+    if remove_task(uid):
+        await update.message.reply_text(f"🗑️ টাস্ক মুছে ফেলা হয়েছে: UID {uid}")
+    else:
+        await update.message.reply_text(f"কোনো টাস্ক পাওয়া যায়নি UID {uid} এর জন্য।")
+
+async def stauto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("এই কমান্ডটি শুধুমাত্র admin ব্যবহার করতে পারবে।")
+        return
+    ok_cnt, fail_cnt = await run_daily_jobs(context)
+    await update.message.reply_text(f"Manual auto-like সম্পন্ন। ✅ {ok_cnt}, ❌ {fail_cnt}")
+
+async def extendauto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("এই কমান্ডটি শুধুমাত্র admin ব্যবহার করতে পারবে।")
+        return
+    args = context.args
+    if len(args) < 2 or not args[1].lstrip("-").isdigit():
+        await update.message.reply_text("ব্যবহার: /extendauto <uid> <+/-days>\nউদাহরণ: /extendauto 8385763215 +7")
+        return
+    uid = args[0].strip()
+    delta = int(args[1])
+    new_days = extend_task_days(uid, delta)
+    if new_days is None:
+        await update.message.reply_text("এই UID-এর কোনো টাস্ক পাওয়া যায়নি।")
+    else:
+        await update.message.reply_text(f"✅ UID {uid} টাস্ক আপডেট হয়েছে। নতুন days_remaining: {new_days}")
+
+# ----------------------------
+# Daily job
+# ----------------------------
+async def run_daily_jobs(context: ContextTypes.DEFAULT_TYPE):
+    rows = get_all_tasks()
+    ok_cnt, fail_cnt = 0, 0
+    for r in rows:
+        uid = r["uid"]
+        days = r["days_remaining"]
+        if days <= 0:
+            remove_task(uid)
+            continue
+        ok, msg = call_like_api(uid)
+        if ok:
+            ok_cnt += 1
+            extend_task_days(uid, -1)
+            with CON:
+                cur = CON.execute("SELECT days_remaining FROM tasks WHERE uid = ?", (uid,))
+                left = cur.fetchone()["days_remaining"]
+            if left <= 0:
+                remove_task(uid)
+        else:
+            fail_cnt += 1
+            try:
+                await context.bot.send_message(chat_id=r["creator_id"],
+                                               text=f"❌ Auto-like FAILED for UID {uid}\nকারণ: {msg}")
+            except Exception as e:
+                log.warning(f"Notify failed: {e}")
+    log.info(f"Daily job done: ok={ok_cnt}, fail={fail_cnt}")
+    return ok_cnt, fail_cnt
+
+async def daily_job_callback(context: ContextTypes.DEFAULT_TYPE):
+    await run_daily_jobs(context)
+
+# ----------------------------
+# Webhook bootstrap
+# ----------------------------
+async def health_handler(_request):
+    return web.Response(text="ok")
+
+def make_web_app(application: Application) -> web.Application:
+    app = web.Application()
+    app.router.add_get(HEALTH_PATH, health_handler)
+    return app
+
+def main():
+    if BOT_TOKEN == "REPLACE_ME":
+        raise RuntimeError("Set BOT_TOKEN env var before running.")
+    if not WEBHOOK_BASE:
+        raise RuntimeError("Set WEBHOOK_BASE env var to your public Render URL")
+
+    application: Application = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start_cmd))
+    application.add_handler(CommandHandler("help", help_cmd))
+    application.add_handler(CommandHandler("like", like_cmd))
+    application.add_handler(CommandHandler("auto", auto_cmd))
+    application.add_handler(CommandHandler("myautos", myautos_cmd))
+    application.add_handler(CommandHandler("removeauto", removeauto_cmd))
+    application.add_handler(CommandHandler("stauto", stauto_cmd))
+    application.add_handler(CommandHandler("extendauto", extendauto_cmd))
+
+    application.job_queue.run_daily(
+        daily_job_callback,
+        time=time(hour=7, minute=0, tzinfo=TZ),
+        name="auto-like-daily",
+    )
+
+    webhook_url = WEBHOOK_BASE.rstrip("/") + WEBHOOK_PATH
+    web_app = make_web_app(application)
+    application.run_webhook(
+        listen=HOST,
+        port=PORT,
+        url_path=WEBHOOK_PATH.lstrip("/"),
+        webhook_url=webhook_url,
+        secret_token=WEBHOOK_SECRET,
+        web_app=web_app,
+        drop_pending_updates=True,
+    )
+
+if __name__ == "__main__":
+    main()
