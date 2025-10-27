@@ -1,21 +1,16 @@
 #!/usr/bin/env python3
 import os
-import sys
 import logging
 import sqlite3
 import requests
 import threading
-import traceback
 from datetime import datetime, timezone, timedelta
 import pytz
 import time
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.constants import ParseMode
-from telegram.error import TelegramError, RetryAfter, FloodError
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
-from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED
+from telegram.error import TelegramError
 
 # ---------------- Config ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -41,18 +36,9 @@ logger = logging.getLogger(__name__)
 # ---------------- Database ----------------
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 db_lock = threading.Lock()
-db_connection = None
 
 def get_db_connection():
-    global db_connection
-    if db_connection is None:
-        try:
-            db_connection = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
-            logger.info("Database connection established")
-        except Exception as e:
-            logger.error(f"Failed to connect to database: {e}")
-            raise
-    return db_connection
+    return sqlite3.connect(DB_PATH, timeout=30)
 
 def init_db():
     try:
@@ -91,20 +77,13 @@ def init_db():
         )
         """)
         conn.commit()
+        conn.close()
         logger.info("Database initialized successfully")
     except Exception as e:
         logger.error(f"Failed to initialize database: {e}")
         raise
 
 init_db()
-
-# ---------------- Scheduler Error Handling ----------------
-def scheduler_listener(event):
-    if event.exception:
-        logger.error(f"Job crashed: {event.job_id}")
-        logger.error(traceback.format_exc())
-    elif event.code == EVENT_JOB_MISSED:
-        logger.warning(f"Job missed: {event.job_id}")
 
 # ---------------- Helpers ----------------
 def is_admin(user_id: int) -> bool:
@@ -116,17 +95,19 @@ def get_user_row(telegram_id: int):
             conn = get_db_connection()
             cur = conn.cursor()
             cur.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,))
-            return cur.fetchone()
+            row = cur.fetchone()
+            conn.close()
+            return row
     except Exception as e:
         logger.error(f"Error getting user row for {telegram_id}: {e}")
         return None
 
 def ensure_user(telegram_id: int):
     try:
-        with db_lock:
-            conn = get_db_connection()
-            cur = conn.cursor()
-            if not get_user_row(telegram_id):
+        if not get_user_row(telegram_id):
+            with db_lock:
+                conn = get_db_connection()
+                cur = conn.cursor()
                 now = datetime.now(timezone.utc).isoformat()
                 cur.execute("""
                     INSERT INTO users (
@@ -135,6 +116,7 @@ def ensure_user(telegram_id: int):
                     ) VALUES (?, 0, 0, NULL, NULL, 0, 0, ?, ?)
                 """, (telegram_id, now, now))
                 conn.commit()
+                conn.close()
                 logger.info(f"Created new user record for {telegram_id}")
     except Exception as e:
         logger.error(f"Error ensuring user {telegram_id}: {e}")
@@ -147,6 +129,8 @@ def reset_daily_counts_if_needed(telegram_id: int):
             cur = conn.cursor()
             cur.execute("SELECT daily_likes_used, daily_autos_used, last_like_reset, last_auto_reset FROM users WHERE telegram_id = ?", (telegram_id,))
             result = cur.fetchone()
+            conn.close()
+            
             if not result:
                 return
                 
@@ -166,8 +150,13 @@ def reset_daily_counts_if_needed(telegram_id: int):
                 last_like_bd = now_bd - timedelta(days=1)
                 
             if last_like_bd.date() < now_bd.date():
-                cur.execute("UPDATE users SET daily_likes_used = 0, last_like_reset = ? WHERE telegram_id = ?", 
-                            (now_utc.isoformat(), telegram_id))
+                with db_lock:
+                    conn = get_db_connection()
+                    cur = conn.cursor()
+                    cur.execute("UPDATE users SET daily_likes_used = 0, last_like_reset = ? WHERE telegram_id = ?", 
+                                (now_utc.isoformat(), telegram_id))
+                    conn.commit()
+                    conn.close()
             
             # Check auto reset
             if last_auto_reset:
@@ -180,10 +169,13 @@ def reset_daily_counts_if_needed(telegram_id: int):
                 last_auto_bd = now_bd - timedelta(days=1)
                 
             if last_auto_bd.date() < now_bd.date():
-                cur.execute("UPDATE users SET daily_autos_used = 0, last_auto_reset = ? WHERE telegram_id = ?", 
-                            (now_utc.isoformat(), telegram_id))
-                
-            conn.commit()
+                with db_lock:
+                    conn = get_db_connection()
+                    cur = conn.cursor()
+                    cur.execute("UPDATE users SET daily_autos_used = 0, last_auto_reset = ? WHERE telegram_id = ?", 
+                                (now_utc.isoformat(), telegram_id))
+                    conn.commit()
+                    conn.close()
     except Exception as e:
         logger.error(f"Error resetting daily counts for {telegram_id}: {e}")
 
@@ -261,6 +253,7 @@ def record_like_use(telegram_id: int):
             cur = conn.cursor()
             cur.execute("UPDATE users SET daily_likes_used = daily_likes_used + 1 WHERE telegram_id = ?", (telegram_id,))
             conn.commit()
+            conn.close()
     except Exception as e:
         logger.error(f"Error recording like use for {telegram_id}: {e}")
 
@@ -272,6 +265,7 @@ def record_auto_use(telegram_id: int):
             cur = conn.cursor()
             cur.execute("UPDATE users SET daily_autos_used = daily_autos_used + 1 WHERE telegram_id = ?", (telegram_id,))
             conn.commit()
+            conn.close()
     except Exception as e:
         logger.error(f"Error recording auto use for {telegram_id}: {e}")
 
@@ -283,6 +277,7 @@ def log_event(level, message):
             cur.execute("INSERT INTO logs (ts, level, message) VALUES (?, ?, ?)", 
                        (datetime.now(timezone.utc).isoformat(), level, message))
             conn.commit()
+            conn.close()
         logger.info(f"{level}: {message}")
     except Exception as e:
         logger.error(f"Error logging event: {e}")
@@ -299,69 +294,12 @@ def call_like_api(uid: str):
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
 
-# ---------------- Scheduler ----------------
-scheduler = BackgroundScheduler(timezone=TZ)
-scheduler.add_listener(scheduler_listener, EVENT_JOB_ERROR | EVENT_JOB_MISSED)
-
-def run_all_active_autos_once(context=None):
-    """Run all autos one-by-one. Called at daily schedule AND manual /stauto"""
-    try:
-        with db_lock:
-            conn = get_db_connection()
-            cur = conn.cursor()
-            cur.execute("SELECT id, uid, owner_id, days_left FROM autos WHERE days_left > 0")
-            rows = cur.fetchall()
-        
-        results = []
-        for id_, uid, owner_id, days_left in rows:
-            try:
-                success, resp = call_like_api(uid)
-                now_iso = datetime.now(timezone.utc).isoformat()
-                
-                with db_lock:
-                    conn = get_db_connection()
-                    cur = conn.cursor()
-                    if success:
-                        cur.execute("""
-                            UPDATE autos 
-                            SET days_left = days_left - 1, last_run = ?, last_error = NULL 
-                            WHERE id = ?
-                        """, (now_iso, id_))
-                        log_event("INFO", f"Auto like success for uid={uid} (task {id_}) owner={owner_id}")
-                    else:
-                        cur.execute("""
-                            UPDATE autos 
-                            SET last_run = ?, last_error = ? 
-                            WHERE id = ?
-                        """, (now_iso, resp, id_))
-                        log_event("ERROR", f"Auto like FAILED for uid={uid} (task {id_}) owner={owner_id} — {resp}")
-                    conn.commit()
-                
-                results.append((id_, uid, success, resp))
-                
-                # Small delay to avoid rate limiting
-                time.sleep(1)
-            except Exception as e:
-                logger.error(f"Error processing auto task {id_}: {e}")
-                results.append((id_, uid, False, str(e)))
-        
-        return results
-    except Exception as e:
-        logger.error(f"Error in run_all_active_autos_once: {e}")
-        return []
-
-# Schedule daily run at 07:00 BD time
-scheduler.add_job(run_all_active_autos_once, CronTrigger(hour=7, minute=0, timezone=TZ))
-scheduler.start()
-
 # ---------------- Bot Command Handlers ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_text("Free Fire Auto Like Bot ready. Use /help to see commands.")
-    except TelegramError as e:
-        logger.error(f"Telegram error in start command: {e}")
     except Exception as e:
-        logger.error(f"Unexpected error in start command: {e}")
+        logger.error(f"Error in start command: {e}")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -373,9 +311,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Example: /auto 8385763215 30\n\n"
             "/myautos - View your active auto like tasks\n\n"
             "/removeauto <uid> - Remove an auto like task\n\n"
-            "/stauto - Start auto like process manually (admin only)\n\n"
-            "/status - Check bot status (admin only)\n\n"
-            "Auto like tasks run daily at 7:00 AM Bangladesh Time (UTC+6)\n\n"
+            "/status - Check bot status\n\n"
             "Admin Commands (use by replying to a user message where noted):\n"
             "/permitlike - Grant like permission (reply to user)\n"
             "/permitauto - Grant auto permission (reply to user)\n"
@@ -390,10 +326,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "- Daily auto tasks: 5 (if permitted)\n"
         )
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-    except TelegramError as e:
-        logger.error(f"Telegram error in help command: {e}")
     except Exception as e:
-        logger.error(f"Unexpected error in help command: {e}")
+        logger.error(f"Error in help command: {e}")
 
 async def like_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -417,11 +351,8 @@ async def like_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(f"❌ Failed to send like to UID `{uid}`\nError: {resp}", parse_mode=ParseMode.MARKDOWN)
             log_event("ERROR", f"/like failed by {user.id} for uid={uid}: {resp}")
-    except TelegramError as e:
-        logger.error(f"Telegram error in like command: {e}")
-        await update.message.reply_text("❌ Telegram API error occurred. Please try again later.")
     except Exception as e:
-        logger.error(f"Unexpected error in like command: {e}")
+        logger.error(f"Error in like command: {e}")
         await update.message.reply_text("❌ An error occurred while processing your request.")
 
 async def auto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -462,6 +393,7 @@ async def auto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 VALUES (?, ?, ?, ?)
             """, (uid, owner_id, days, datetime.now(timezone.utc).isoformat()))
             conn.commit()
+            conn.close()
         
         record_auto_use(owner_id)
         await update.message.reply_text(
@@ -471,11 +403,8 @@ async def auto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Owner: {owner_id}",
             parse_mode=ParseMode.MARKDOWN
         )
-    except TelegramError as e:
-        logger.error(f"Telegram error in auto command: {e}")
-        await update.message.reply_text("❌ Telegram API error occurred. Please try again later.")
     except Exception as e:
-        logger.error(f"Unexpected error in auto command: {e}")
+        logger.error(f"Error in auto command: {e}")
         await update.message.reply_text("❌ An error occurred while processing your request.")
 
 async def myautos_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -492,6 +421,7 @@ async def myautos_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 WHERE owner_id = ? AND days_left > 0
             """, (user.id,))
             rows = cur.fetchall()
+            conn.close()
         
         if not rows:
             await update.message.reply_text("No active auto-like tasks found for you.")
@@ -513,11 +443,8 @@ async def myautos_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg_lines.append(line)
         
         await update.message.reply_text("\n\n".join(msg_lines), parse_mode=ParseMode.MARKDOWN)
-    except TelegramError as e:
-        logger.error(f"Telegram error in myautos command: {e}")
-        await update.message.reply_text("❌ Telegram API error occurred. Please try again later.")
     except Exception as e:
-        logger.error(f"Unexpected error in myautos command: {e}")
+        logger.error(f"Error in myautos command: {e}")
         await update.message.reply_text("❌ An error occurred while processing your request.")
 
 async def removeauto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -539,77 +466,29 @@ async def removeauto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 cur.execute("DELETE FROM autos WHERE uid = ? AND owner_id = ?", (uid, user.id))
             changed = cur.rowcount
             conn.commit()
+            conn.close()
         
         if changed:
             await update.message.reply_text(f"✅ Removed {changed} auto task(s) for UID `{uid}`", parse_mode=ParseMode.MARKDOWN)
         else:
             await update.message.reply_text("❌ No matching task found or you don't have permission to remove it.")
-    except TelegramError as e:
-        logger.error(f"Telegram error in removeauto command: {e}")
-        await update.message.reply_text("❌ Telegram API error occurred. Please try again later.")
     except Exception as e:
-        logger.error(f"Unexpected error in removeauto command: {e}")
-        await update.message.reply_text("❌ An error occurred while processing your request.")
-
-async def stauto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        user = update.effective_user
-        if not is_admin(user.id):
-            await update.message.reply_text("❌ Only admins can manually start auto-run.")
-            return
-        
-        await update.message.reply_text("🔄 Starting manual auto-like run now...")
-        results = run_all_active_autos_once()
-        
-        lines = []
-        success_count = 0
-        for id_, uid, ok, resp in results:
-            if ok:
-                lines.append(f"✅ Task {id_} (UID: {uid}) succeeded")
-                success_count += 1
-            else:
-                lines.append(f"❌ Task {id_} (UID: {uid}) failed: {resp[:50]}...")
-        
-        summary = f"\n\nSummary: {success_count}/{len(results)} tasks succeeded"
-        await update.message.reply_text("\n".join(lines) + summary)
-    except TelegramError as e:
-        logger.error(f"Telegram error in stauto command: {e}")
-        await update.message.reply_text("❌ Telegram API error occurred. Please try again later.")
-    except Exception as e:
-        logger.error(f"Unexpected error in stauto command: {e}")
+        logger.error(f"Error in removeauto command: {e}")
         await update.message.reply_text("❌ An error occurred while processing your request.")
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        if not is_admin(update.effective_user.id):
-            await update.message.reply_text("❌ Only admins can check bot status.")
-            return
-        
-        # Check database connection
-        db_status = "Connected"
-        try:
-            conn = get_db_connection()
-            cur = conn.cursor()
-            cur.execute("SELECT 1")
-            cur.fetchone()
-        except:
-            db_status = "Disconnected"
-        
         status_text = (
             "🤖 Bot Status Report\n\n"
             f"✅ Bot is running\n"
             f"⏰ Current time: {datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"📅 Scheduler status: {'Running' if scheduler.running else 'Stopped'}\n"
-            f"🗄️ Database: {db_status}\n"
-            f"🔧 Python version: {sys.version.split()[0]}\n"
-            f"📦 Active jobs: {len(scheduler.get_jobs())}"
+            f"🗄️ Database: Connected\n"
+            f"🔧 Python version: {os.sys.version.split()[0]}"
         )
         
         await update.message.reply_text(status_text)
-    except TelegramError as e:
-        logger.error(f"Telegram error in status command: {e}")
     except Exception as e:
-        logger.error(f"Unexpected error in status command: {e}")
+        logger.error(f"Error in status command: {e}")
 
 # Permission admin commands (reply based)
 async def permitlike_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -630,13 +509,11 @@ async def permitlike_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cur = conn.cursor()
             cur.execute("UPDATE users SET permit_like = 1 WHERE telegram_id = ?", (target.id,))
             conn.commit()
+            conn.close()
         
         await update.message.reply_text(f"✅ Granted like permission to {target.full_name} ({target.id}).")
-    except TelegramError as e:
-        logger.error(f"Telegram error in permitlike command: {e}")
-        await update.message.reply_text("❌ Telegram API error occurred. Please try again later.")
     except Exception as e:
-        logger.error(f"Unexpected error in permitlike command: {e}")
+        logger.error(f"Error in permitlike command: {e}")
         await update.message.reply_text("❌ An error occurred while processing your request.")
 
 async def permitauto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -657,13 +534,11 @@ async def permitauto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cur = conn.cursor()
             cur.execute("UPDATE users SET permit_auto = 1 WHERE telegram_id = ?", (target.id,))
             conn.commit()
+            conn.close()
         
         await update.message.reply_text(f"✅ Granted auto permission to {target.full_name} ({target.id}).")
-    except TelegramError as e:
-        logger.error(f"Telegram error in permitauto command: {e}")
-        await update.message.reply_text("❌ Telegram API error occurred. Please try again later.")
     except Exception as e:
-        logger.error(f"Unexpected error in permitauto command: {e}")
+        logger.error(f"Error in permitauto command: {e}")
         await update.message.reply_text("❌ An error occurred while processing your request.")
 
 async def rmlike_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -684,13 +559,11 @@ async def rmlike_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cur = conn.cursor()
             cur.execute("UPDATE users SET permit_like = 0 WHERE telegram_id = ?", (target.id,))
             conn.commit()
+            conn.close()
         
         await update.message.reply_text(f"✅ Removed like permission from {target.full_name} ({target.id}).")
-    except TelegramError as e:
-        logger.error(f"Telegram error in rmlike command: {e}")
-        await update.message.reply_text("❌ Telegram API error occurred. Please try again later.")
     except Exception as e:
-        logger.error(f"Unexpected error in rmlike command: {e}")
+        logger.error(f"Error in rmlike command: {e}")
         await update.message.reply_text("❌ An error occurred while processing your request.")
 
 async def rmauto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -711,13 +584,11 @@ async def rmauto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cur = conn.cursor()
             cur.execute("UPDATE users SET permit_auto = 0 WHERE telegram_id = ?", (target.id,))
             conn.commit()
+            conn.close()
         
         await update.message.reply_text(f"✅ Removed auto permission from {target.full_name} ({target.id}).")
-    except TelegramError as e:
-        logger.error(f"Telegram error in rmauto command: {e}")
-        await update.message.reply_text("❌ Telegram API error occurred. Please try again later.")
     except Exception as e:
-        logger.error(f"Unexpected error in rmauto command: {e}")
+        logger.error(f"Error in rmauto command: {e}")
         await update.message.reply_text("❌ An error occurred while processing your request.")
 
 async def setlimit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -752,15 +623,14 @@ async def setlimit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 cur.execute("UPDATE users SET auto_limit = ? WHERE telegram_id = ?", (limit, tid))
             else:
                 await update.message.reply_text("❌ Type must be 'like' or 'auto'.")
+                conn.close()
                 return
             conn.commit()
+            conn.close()
         
         await update.message.reply_text(f"✅ Set {typ} limit for {tid} to {limit}.")
-    except TelegramError as e:
-        logger.error(f"Telegram error in setlimit command: {e}")
-        await update.message.reply_text("❌ Telegram API error occurred. Please try again later.")
     except Exception as e:
-        logger.error(f"Unexpected error in setlimit command: {e}")
+        logger.error(f"Error in setlimit command: {e}")
         await update.message.reply_text("❌ An error occurred while processing your request.")
 
 async def removelimit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -792,15 +662,14 @@ async def removelimit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 cur.execute("UPDATE users SET auto_limit = NULL WHERE telegram_id = ?", (tid,))
             else:
                 await update.message.reply_text("❌ Type must be 'like' or 'auto'.")
+                conn.close()
                 return
             conn.commit()
+            conn.close()
         
         await update.message.reply_text(f"✅ Removed custom {typ} limit for {tid} (back to default).")
-    except TelegramError as e:
-        logger.error(f"Telegram error in removelimit command: {e}")
-        await update.message.reply_text("❌ Telegram API error occurred. Please try again later.")
     except Exception as e:
-        logger.error(f"Unexpected error in removelimit command: {e}")
+        logger.error(f"Error in removelimit command: {e}")
         await update.message.reply_text("❌ An error occurred while processing your request.")
 
 async def viewlimits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -817,6 +686,7 @@ async def viewlimits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 FROM users
             """)
             rows = cur.fetchall()
+            conn.close()
         
         lines = []
         for tid, pl, pa, ll, al in rows:
@@ -829,11 +699,8 @@ async def viewlimits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         
         await update.message.reply_text("\n\n".join(lines) if lines else "No user limits found.")
-    except TelegramError as e:
-        logger.error(f"Telegram error in viewlimits command: {e}")
-        await update.message.reply_text("❌ Telegram API error occurred. Please try again later.")
     except Exception as e:
-        logger.error(f"Unexpected error in viewlimits command: {e}")
+        logger.error(f"Error in viewlimits command: {e}")
         await update.message.reply_text("❌ An error occurred while processing your request.")
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -859,6 +726,7 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             cur.execute("SELECT COUNT(*) FROM logs WHERE ts > datetime('now', '-1 day')")
             recent_logs = cur.fetchone()[0]
+            conn.close()
         
         stats_text = (
             "📊 Bot Statistics:\n\n"
@@ -869,18 +737,14 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Recent log entries (24h): {recent_logs}"
         )
         await update.message.reply_text(stats_text)
-    except TelegramError as e:
-        logger.error(f"Telegram error in stats command: {e}")
-        await update.message.reply_text("❌ Telegram API error occurred. Please try again later.")
     except Exception as e:
-        logger.error(f"Unexpected error in stats command: {e}")
+        logger.error(f"Error in stats command: {e}")
         await update.message.reply_text("❌ An error occurred while processing your request.")
 
 # Generic error handler
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         logger.error(f"Update {update} caused error {context.error}")
-        logger.error(traceback.format_exc())
         
         # Only send error message if we have a message to reply to
         if update and update.effective_message:
@@ -907,7 +771,6 @@ def main():
         application.add_handler(CommandHandler("auto", auto_cmd))
         application.add_handler(CommandHandler("myautos", myautos_cmd))
         application.add_handler(CommandHandler("removeauto", removeauto_cmd))
-        application.add_handler(CommandHandler("stauto", stauto_cmd))
         application.add_handler(CommandHandler("status", status_cmd))
 
         # Admin permission commands
@@ -929,19 +792,7 @@ def main():
         application.run_polling()
     except Exception as e:
         logger.error(f"Failed to start bot: {e}")
-        logger.error(traceback.format_exc())
     finally:
-        try:
-            scheduler.shutdown()
-        except:
-            pass
-        
-        try:
-            if db_connection:
-                db_connection.close()
-        except:
-            pass
-        
         logger.info("Bot stopped")
 
 if __name__ == "__main__":
