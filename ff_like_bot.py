@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 import os
+import sys
 import logging
 import sqlite3
 import requests
 import threading
 from datetime import datetime, timezone, timedelta
 import pytz
-import time
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.constants import ParseMode
@@ -483,7 +483,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Bot is running\n"
             f"⏰ Current time: {datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"🗄️ Database: Connected\n"
-            f"🔧 Python version: {os.sys.version.split()[0]}"
+            f"🔧 Python version: {sys.version.split()[0]}"
         )
         
         await update.message.reply_text(status_text)
