@@ -6,9 +6,11 @@ from datetime import datetime, time
 from typing import Optional
 
 from pytz import timezone
+from aiohttp import web
+
 from telegram import Update
 from telegram.ext import (
-    Application, CommandHandler, ContextTypes
+    Application, ApplicationBuilder, CommandHandler, ContextTypes
 )
 
 # ----------------------------
@@ -22,6 +24,14 @@ SERVER_NAME = os.getenv("SERVER_NAME", "bd")
 
 DB_PATH = os.getenv("DB_PATH", "data.db")
 TZ = timezone("Asia/Dhaka")
+
+# Webhook config (Render Web Service)
+WEBHOOK_BASE = os.getenv("WEBHOOK_BASE")  # e.g. https://amar-hizi-bizzi-bot-like-1.onrender.com
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")  # random strong string
+PORT = int(os.getenv("PORT", "10000"))
+HOST = "0.0.0.0"
+WEBHOOK_PATH = f"/{BOT_TOKEN}"  # unique path; Telegram will POST here
+HEALTH_PATH = "/healthz"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("ff-like-bot")
@@ -84,7 +94,6 @@ def extend_task_days(uid: str, delta_days: int) -> Optional[int]:
 # Like API
 # ----------------------------
 def call_like_api(uid: str) -> (bool, str):
-    """Returns (ok, message)."""
     try:
         r = requests.get(
             LIKE_API_BASE,
@@ -209,19 +218,17 @@ async def extendauto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ UID {uid} টাস্ক আপডেট হয়েছে। নতুন days_remaining: {new_days}")
 
 # ----------------------------
-# Daily job (JobQueue → 7:00 Asia/Dhaka)
+# Daily job
 # ----------------------------
 async def run_daily_jobs(context: ContextTypes.DEFAULT_TYPE):
     rows = get_all_tasks()
     ok_cnt, fail_cnt = 0, 0
-
     for r in rows:
         uid = r["uid"]
         days = r["days_remaining"]
         if days <= 0:
             remove_task(uid)
             continue
-
         ok, msg = call_like_api(uid)
         if ok:
             ok_cnt += 1
@@ -234,13 +241,10 @@ async def run_daily_jobs(context: ContextTypes.DEFAULT_TYPE):
         else:
             fail_cnt += 1
             try:
-                await context.bot.send_message(
-                    chat_id=r["creator_id"],
-                    text=f"❌ Auto-like FAILED for UID {uid}\nকারণ: {msg}"
-                )
+                await context.bot.send_message(chat_id=r["creator_id"],
+                                               text=f"❌ Auto-like FAILED for UID {uid}\nকারণ: {msg}")
             except Exception as e:
                 log.warning(f"Notify failed: {e}")
-
     log.info(f"Daily job done: ok={ok_cnt}, fail={fail_cnt}")
     return ok_cnt, fail_cnt
 
@@ -248,13 +252,25 @@ async def daily_job_callback(context: ContextTypes.DEFAULT_TYPE):
     await run_daily_jobs(context)
 
 # ----------------------------
-# Bootstrap
+# Webhook (aiohttp web_app) + Bot bootstrap
 # ----------------------------
+async def health_handler(_request):
+    return web.Response(text="ok")
+
+def make_web_app(application: Application) -> web.Application:
+    app = web.Application()
+    # Telegram webhook will be attached by PTB; we add health
+    app.router.add_get(HEALTH_PATH, health_handler)
+    # PTB attaches POST route at WEBHOOK_PATH internally
+    return app
+
 def main():
     if BOT_TOKEN == "REPLACE_ME":
         raise RuntimeError("Set BOT_TOKEN env var before running.")
+    if not WEBHOOK_BASE:
+        raise RuntimeError("Set WEBHOOK_BASE env var to your public Render URL (e.g. https://your-service.onrender.com)")
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    application: Application = ApplicationBuilder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("help", help_cmd))
@@ -269,10 +285,23 @@ def main():
     application.job_queue.run_daily(
         daily_job_callback,
         time=time(hour=7, minute=0, tzinfo=TZ),
-        name="auto-like-daily"
+        name="auto-like-daily",
     )
 
-    application.run_polling()
+    # Build the webhook URL
+    webhook_url = WEBHOOK_BASE.rstrip("/") + WEBHOOK_PATH
+
+    # Start webhook server (PTB will set the webhook and add POST route)
+    web_app = make_web_app(application)
+    application.run_webhook(
+        listen=HOST,
+        port=PORT,
+        url_path=WEBHOOK_PATH.lstrip("/"),
+        webhook_url=webhook_url,
+        secret_token=WEBHOOK_SECRET,
+        web_app=web_app,
+        drop_pending_updates=True,
+    )
 
 if __name__ == "__main__":
     main()
