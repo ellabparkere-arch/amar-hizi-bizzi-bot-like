@@ -2,23 +2,20 @@ import os
 import logging
 import sqlite3
 import requests
-from datetime import datetime
+from datetime import datetime, time
 from typing import Optional
 
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
 from pytz import timezone
-
 from telegram import Update
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, ContextTypes
+    Application, CommandHandler, ContextTypes
 )
 
 # ----------------------------
 # Config / ENV
 # ----------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "REPLACE_ME")
-ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}  # e.g. "123,456"
+ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 LIKE_API_BASE = "https://yunus-bhai-like-ff.vercel.app/like"
 LIKE_API_KEY = os.getenv("LIKE_API_KEY", "gst")
 SERVER_NAME = os.getenv("SERVER_NAME", "bd")
@@ -94,15 +91,12 @@ def call_like_api(uid: str) -> (bool, str):
             params={"uid": uid, "server_name": SERVER_NAME, "key": LIKE_API_KEY},
             timeout=20
         )
-        # Try to parse JSON; fallback to text
         try:
             data = r.json()
-            # Common fields guess:
             success = bool(data.get("success", r.ok))
             msg = data.get("message") or data.get("msg") or str(data)
             return success, msg
         except Exception:
-            # Not JSON
             if r.ok:
                 return True, f"OK: {r.text[:200]}"
             else:
@@ -111,7 +105,7 @@ def call_like_api(uid: str) -> (bool, str):
         return False, f"Network error: {e}"
 
 # ----------------------------
-# Telegram helpers
+# Helpers
 # ----------------------------
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
@@ -130,7 +124,7 @@ HELP_TEXT = (
 )
 
 # ----------------------------
-# Command handlers
+# Commands
 # ----------------------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_TEXT)
@@ -194,8 +188,8 @@ async def stauto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(user_id):
         await update.message.reply_text("এই কমান্ডটি শুধুমাত্র admin ব্যবহার করতে পারবে।")
         return
-    count_ok, count_fail = await run_daily_jobs(context)
-    await update.message.reply_text(f"Manual auto-like সম্পন্ন। ✅ {count_ok}, ❌ {count_fail}")
+    ok_cnt, fail_cnt = await run_daily_jobs(context)
+    await update.message.reply_text(f"Manual auto-like সম্পন্ন। ✅ {ok_cnt}, ❌ {fail_cnt}")
 
 async def extendauto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -215,7 +209,7 @@ async def extendauto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ UID {uid} টাস্ক আপডেট হয়েছে। নতুন days_remaining: {new_days}")
 
 # ----------------------------
-# Scheduler job
+# Daily job (JobQueue → 7:00 Asia/Dhaka)
 # ----------------------------
 async def run_daily_jobs(context: ContextTypes.DEFAULT_TYPE):
     rows = get_all_tasks()
@@ -231,9 +225,7 @@ async def run_daily_jobs(context: ContextTypes.DEFAULT_TYPE):
         ok, msg = call_like_api(uid)
         if ok:
             ok_cnt += 1
-            # Decrement day
             extend_task_days(uid, -1)
-            # If now zero, remove
             with CON:
                 cur = CON.execute("SELECT days_remaining FROM tasks WHERE uid = ?", (uid,))
                 left = cur.fetchone()["days_remaining"]
@@ -241,7 +233,6 @@ async def run_daily_jobs(context: ContextTypes.DEFAULT_TYPE):
                 remove_task(uid)
         else:
             fail_cnt += 1
-            # Don’t decrement on failure; show reason to creator (if possible)
             try:
                 await context.bot.send_message(
                     chat_id=r["creator_id"],
@@ -253,21 +244,17 @@ async def run_daily_jobs(context: ContextTypes.DEFAULT_TYPE):
     log.info(f"Daily job done: ok={ok_cnt}, fail={fail_cnt}")
     return ok_cnt, fail_cnt
 
-def schedule_jobs(app):
-    scheduler = BackgroundScheduler(timezone=TZ)
-    # Run every day at 07:00 Asia/Dhaka
-    scheduler.add_job(lambda: app.create_task(run_daily_jobs(app.bot)), CronTrigger(hour=7, minute=0))
-    scheduler.start()
-    return scheduler
+async def daily_job_callback(context: ContextTypes.DEFAULT_TYPE):
+    await run_daily_jobs(context)
 
 # ----------------------------
-# App bootstrap
+# Bootstrap
 # ----------------------------
 def main():
     if BOT_TOKEN == "REPLACE_ME":
         raise RuntimeError("Set BOT_TOKEN env var before running.")
 
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("help", help_cmd))
@@ -276,13 +263,16 @@ def main():
     application.add_handler(CommandHandler("myautos", myautos_cmd))
     application.add_handler(CommandHandler("removeauto", removeauto_cmd))
     application.add_handler(CommandHandler("stauto", stauto_cmd))
-    application.add_handler(CommandHandler("extendauto", extendauto_cmd))  # optional extra
+    application.add_handler(CommandHandler("extendauto", extendauto_cmd))
 
-    # Start scheduler after app is ready
-    schedule_jobs(application)
+    # JobQueue: run daily at 07:00 Asia/Dhaka
+    application.job_queue.run_daily(
+        daily_job_callback,
+        time=time(hour=7, minute=0, tzinfo=TZ),
+        name="auto-like-daily"
+    )
 
-    log.info("Bot is running (long-polling)…")
-    application.run_polling(close_loop=False)
+    application.run_polling()
 
 if __name__ == "__main__":
     main()
