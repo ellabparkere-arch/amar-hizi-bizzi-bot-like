@@ -6,20 +6,9 @@ import requests
 import threading
 from datetime import datetime, timezone, timedelta
 import pytz
-
-# Try to import for v20.x, fallback to v13.x
-try:
-    # For python-telegram-bot v20.x
-    from telegram import Update
-    from telegram.constants import ParseMode
-    from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
-    USE_V20 = True
-except ImportError:
-    # For python-telegram-bot v13.x
-    from telegram import Update, ParseMode
-    from telegram.ext import Updater, CommandHandler, CallbackContext, MessageHandler, Filters
-    USE_V20 = False
-
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.constants import ParseMode
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -268,10 +257,10 @@ scheduler.add_job(run_all_active_autos_once, CronTrigger(hour=7, minute=0, timez
 scheduler.start()
 
 # ---------------- Bot Command Handlers ----------------
-def start(update: Update, context):
-    update.message.reply_text("Free Fire Auto Like Bot ready. Use /help to see commands.")
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Free Fire Auto Like Bot ready. Use /help to see commands.")
 
-def help_cmd(update: Update, context):
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "*Free Fire Auto Like Bot*\n\n"
         "/like <uid> - Send like (requires permission)\n"
@@ -295,36 +284,36 @@ def help_cmd(update: Update, context):
         "- Daily likes: 3 (if permitted)\n"
         "- Daily auto tasks: 5 (if permitted)\n"
     )
-    update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
-def like_cmd(update: Update, context):
+async def like_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user(user.id)
-    args = context.args if USE_V20 else context.args
+    args = context.args
     if len(args) != 1:
-        update.message.reply_text("Usage: /like <uid>")
+        await update.message.reply_text("Usage: /like <uid>")
         return
     
     uid = args[0].strip()
     allowed, reason = can_send_like(user.id)
     if not allowed and not is_admin(user.id):
-        update.message.reply_text(f"❌ Cannot send like: {reason}")
+        await update.message.reply_text(f"❌ Cannot send like: {reason}")
         return
     
     success, resp = call_like_api(uid)
     if success:
         record_like_use(user.id)
-        update.message.reply_text(f"✅ Like sent to UID `{uid}`\nResponse: {resp}", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(f"✅ Like sent to UID `{uid}`\nResponse: {resp}", parse_mode=ParseMode.MARKDOWN)
     else:
-        update.message.reply_text(f"❌ Failed to send like to UID `{uid}`\nError: {resp}", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(f"❌ Failed to send like to UID `{uid}`\nError: {resp}", parse_mode=ParseMode.MARKDOWN)
         log_event("ERROR", f"/like failed by {user.id} for uid={uid}: {resp}")
 
-def auto_cmd(update: Update, context):
+async def auto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user(user.id)
-    args = context.args if USE_V20 else context.args
+    args = context.args
     if len(args) != 2:
-        update.message.reply_text("Usage: /auto <uid> <days>")
+        await update.message.reply_text("Usage: /auto <uid> <days>")
         return
     
     uid = args[0].strip()
@@ -333,13 +322,13 @@ def auto_cmd(update: Update, context):
         if days <= 0:
             raise ValueError
     except ValueError:
-        update.message.reply_text("❌ Days must be a positive integer.")
+        await update.message.reply_text("❌ Days must be a positive integer.")
         return
     
     # Check if user can create auto task
     allowed, reason = can_create_auto(user.id)
     if not allowed and not is_admin(user.id):
-        update.message.reply_text(f"❌ Cannot create auto task: {reason}")
+        await update.message.reply_text(f"❌ Cannot create auto task: {reason}")
         return
     
     owner_id = user.id
@@ -357,7 +346,7 @@ def auto_cmd(update: Update, context):
         db.commit()
     
     record_auto_use(owner_id)
-    update.message.reply_text(
+    await update.message.reply_text(
         f"✅ Auto-like task created:\n"
         f"UID: `{uid}`\n"
         f"Days: {days}\n"
@@ -365,7 +354,7 @@ def auto_cmd(update: Update, context):
         parse_mode=ParseMode.MARKDOWN
     )
 
-def myautos_cmd(update: Update, context):
+async def myautos_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user(user.id)
     
@@ -379,7 +368,7 @@ def myautos_cmd(update: Update, context):
         rows = cur.fetchall()
     
     if not rows:
-        update.message.reply_text("No active auto-like tasks found for you.")
+        await update.message.reply_text("No active auto-like tasks found for you.")
         return
     
     msg_lines = []
@@ -397,13 +386,13 @@ def myautos_cmd(update: Update, context):
             line += f"\n⚠️ Error: {last_error[:50]}..."
         msg_lines.append(line)
     
-    update.message.reply_text("\n\n".join(msg_lines), parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text("\n\n".join(msg_lines), parse_mode=ParseMode.MARKDOWN)
 
-def removeauto_cmd(update: Update, context):
+async def removeauto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    args = context.args if USE_V20 else context.args
+    args = context.args
     if len(args) != 1:
-        update.message.reply_text("Usage: /removeauto <uid>")
+        await update.message.reply_text("Usage: /removeauto <uid>")
         return
     
     uid = args[0].strip()
@@ -418,17 +407,17 @@ def removeauto_cmd(update: Update, context):
         db.commit()
     
     if changed:
-        update.message.reply_text(f"✅ Removed {changed} auto task(s) for UID `{uid}`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(f"✅ Removed {changed} auto task(s) for UID `{uid}`", parse_mode=ParseMode.MARKDOWN)
     else:
-        update.message.reply_text("❌ No matching task found or you don't have permission to remove it.")
+        await update.message.reply_text("❌ No matching task found or you don't have permission to remove it.")
 
-def stauto_cmd(update: Update, context):
+async def stauto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not is_admin(user.id):
-        update.message.reply_text("❌ Only admins can manually start auto-run.")
+        await update.message.reply_text("❌ Only admins can manually start auto-run.")
         return
     
-    update.message.reply_text("🔄 Starting manual auto-like run now...")
+    await update.message.reply_text("🔄 Starting manual auto-like run now...")
     results = run_all_active_autos_once()
     
     lines = []
@@ -441,16 +430,16 @@ def stauto_cmd(update: Update, context):
             lines.append(f"❌ Task {id_} (UID: {uid}) failed: {resp[:50]}...")
     
     summary = f"\n\nSummary: {success_count}/{len(results)} tasks succeeded"
-    update.message.reply_text("\n".join(lines) + summary)
+    await update.message.reply_text("\n".join(lines) + summary)
 
 # Permission admin commands (reply based)
-def permitlike_cmd(update: Update, context):
+async def permitlike_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        update.message.reply_text("❌ Only admins may use this.")
+        await update.message.reply_text("❌ Only admins may use this.")
         return
     
     if not update.message.reply_to_message:
-        update.message.reply_text("❌ Reply to the user's message to grant like permission.")
+        await update.message.reply_text("❌ Reply to the user's message to grant like permission.")
         return
     
     target = update.message.reply_to_message.from_user
@@ -461,15 +450,15 @@ def permitlike_cmd(update: Update, context):
         cur.execute("UPDATE users SET permit_like = 1 WHERE telegram_id = ?", (target.id,))
         db.commit()
     
-    update.message.reply_text(f"✅ Granted like permission to {target.full_name} ({target.id}).")
+    await update.message.reply_text(f"✅ Granted like permission to {target.full_name} ({target.id}).")
 
-def permitauto_cmd(update: Update, context):
+async def permitauto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        update.message.reply_text("❌ Only admins may use this.")
+        await update.message.reply_text("❌ Only admins may use this.")
         return
     
     if not update.message.reply_to_message:
-        update.message.reply_text("❌ Reply to the user's message to grant auto permission.")
+        await update.message.reply_text("❌ Reply to the user's message to grant auto permission.")
         return
     
     target = update.message.reply_to_message.from_user
@@ -480,15 +469,15 @@ def permitauto_cmd(update: Update, context):
         cur.execute("UPDATE users SET permit_auto = 1 WHERE telegram_id = ?", (target.id,))
         db.commit()
     
-    update.message.reply_text(f"✅ Granted auto permission to {target.full_name} ({target.id}).")
+    await update.message.reply_text(f"✅ Granted auto permission to {target.full_name} ({target.id}).")
 
-def rmlike_cmd(update: Update, context):
+async def rmlike_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        update.message.reply_text("❌ Only admins may use this.")
+        await update.message.reply_text("❌ Only admins may use this.")
         return
     
     if not update.message.reply_to_message:
-        update.message.reply_text("❌ Reply to the user's message to remove like permission.")
+        await update.message.reply_text("❌ Reply to the user's message to remove like permission.")
         return
     
     target = update.message.reply_to_message.from_user
@@ -499,15 +488,15 @@ def rmlike_cmd(update: Update, context):
         cur.execute("UPDATE users SET permit_like = 0 WHERE telegram_id = ?", (target.id,))
         db.commit()
     
-    update.message.reply_text(f"✅ Removed like permission from {target.full_name} ({target.id}).")
+    await update.message.reply_text(f"✅ Removed like permission from {target.full_name} ({target.id}).")
 
-def rmauto_cmd(update: Update, context):
+async def rmauto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        update.message.reply_text("❌ Only admins may use this.")
+        await update.message.reply_text("❌ Only admins may use this.")
         return
     
     if not update.message.reply_to_message:
-        update.message.reply_text("❌ Reply to the user's message to remove auto permission.")
+        await update.message.reply_text("❌ Reply to the user's message to remove auto permission.")
         return
     
     target = update.message.reply_to_message.from_user
@@ -518,16 +507,16 @@ def rmauto_cmd(update: Update, context):
         cur.execute("UPDATE users SET permit_auto = 0 WHERE telegram_id = ?", (target.id,))
         db.commit()
     
-    update.message.reply_text(f"✅ Removed auto permission from {target.full_name} ({target.id}).")
+    await update.message.reply_text(f"✅ Removed auto permission from {target.full_name} ({target.id}).")
 
-def setlimit_cmd(update: Update, context):
+async def setlimit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        update.message.reply_text("❌ Only admins may use this.")
+        await update.message.reply_text("❌ Only admins may use this.")
         return
     
-    args = context.args if USE_V20 else context.args
+    args = context.args
     if len(args) != 3:
-        update.message.reply_text("Usage: /setlimit <telegram_id> <like|auto> <limit>")
+        await update.message.reply_text("Usage: /setlimit <telegram_id> <like|auto> <limit>")
         return
     
     try:
@@ -537,7 +526,7 @@ def setlimit_cmd(update: Update, context):
         if limit < 0:
             raise ValueError
     except ValueError:
-        update.message.reply_text("❌ Invalid arguments. ID must be integer, type must be like/auto, limit must be non-negative integer.")
+        await update.message.reply_text("❌ Invalid arguments. ID must be integer, type must be like/auto, limit must be non-negative integer.")
         return
     
     ensure_user(tid)
@@ -549,27 +538,27 @@ def setlimit_cmd(update: Update, context):
         elif typ == "auto":
             cur.execute("UPDATE users SET auto_limit = ? WHERE telegram_id = ?", (limit, tid))
         else:
-            update.message.reply_text("❌ Type must be 'like' or 'auto'.")
+            await update.message.reply_text("❌ Type must be 'like' or 'auto'.")
             return
         db.commit()
     
-    update.message.reply_text(f"✅ Set {typ} limit for {tid} to {limit}.")
+    await update.message.reply_text(f"✅ Set {typ} limit for {tid} to {limit}.")
 
-def removelimit_cmd(update: Update, context):
+async def removelimit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        update.message.reply_text("❌ Only admins may use this.")
+        await update.message.reply_text("❌ Only admins may use this.")
         return
     
-    args = context.args if USE_V20 else context.args
+    args = context.args
     if len(args) != 2:
-        update.message.reply_text("Usage: /removelimit <telegram_id> <like|auto>")
+        await update.message.reply_text("Usage: /removelimit <telegram_id> <like|auto>")
         return
     
     try:
         tid = int(args[0])
         typ = args[1].lower()
     except ValueError:
-        update.message.reply_text("❌ Invalid arguments. ID must be integer, type must be like/auto.")
+        await update.message.reply_text("❌ Invalid arguments. ID must be integer, type must be like/auto.")
         return
     
     ensure_user(tid)
@@ -581,15 +570,15 @@ def removelimit_cmd(update: Update, context):
         elif typ == "auto":
             cur.execute("UPDATE users SET auto_limit = NULL WHERE telegram_id = ?", (tid,))
         else:
-            update.message.reply_text("❌ Type must be 'like' or 'auto'.")
+            await update.message.reply_text("❌ Type must be 'like' or 'auto'.")
             return
         db.commit()
     
-    update.message.reply_text(f"✅ Removed custom {typ} limit for {tid} (back to default).")
+    await update.message.reply_text(f"✅ Removed custom {typ} limit for {tid} (back to default).")
 
-def viewlimits_cmd(update: Update, context):
+async def viewlimits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        update.message.reply_text("❌ Only admins may use this.")
+        await update.message.reply_text("❌ Only admins may use this.")
         return
     
     with db_lock:
@@ -610,11 +599,11 @@ def viewlimits_cmd(update: Update, context):
             f"Auto perm: {'✅' if pa else '❌'} (Limit: {auto_limit})"
         )
     
-    update.message.reply_text("\n\n".join(lines) if lines else "No user limits found.")
+    await update.message.reply_text("\n\n".join(lines) if lines else "No user limits found.")
 
-def stats_cmd(update: Update, context):
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        update.message.reply_text("❌ Only admins may use this.")
+        await update.message.reply_text("❌ Only admins may use this.")
         return
     
     with db_lock:
@@ -642,13 +631,13 @@ def stats_cmd(update: Update, context):
         f"Users with auto permission: {auto_perm_users}\n"
         f"Recent log entries (24h): {recent_logs}"
     )
-    update.message.reply_text(stats_text)
+    await update.message.reply_text(stats_text)
 
 # Generic error handler
-def error_handler(update, context):
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Update {update} caused error {context.error}")
     if update and update.effective_message:
-        update.effective_message.reply_text("❌ An error occurred while processing your command. Please try again later.")
+        await update.effective_message.reply_text("❌ An error occurred while processing your command. Please try again later.")
 
 # ---------------- Main ----------------
 def main():
@@ -656,74 +645,41 @@ def main():
         logger.error("BOT_TOKEN not set in environment variables")
         return
     
-    if USE_V20:
-        # For v20.x
-        application = Application.builder().token(BOT_TOKEN).build()
-        
-        # Command handlers
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CommandHandler("help", help_cmd))
-        application.add_handler(CommandHandler("like", like_cmd))
-        application.add_handler(CommandHandler("auto", auto_cmd))
-        application.add_handler(CommandHandler("myautos", myautos_cmd))
-        application.add_handler(CommandHandler("removeauto", removeauto_cmd))
-        application.add_handler(CommandHandler("stauto", stauto_cmd))
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Command handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_cmd))
+    application.add_handler(CommandHandler("like", like_cmd))
+    application.add_handler(CommandHandler("auto", auto_cmd))
+    application.add_handler(CommandHandler("myautos", myautos_cmd))
+    application.add_handler(CommandHandler("removeauto", removeauto_cmd))
+    application.add_handler(CommandHandler("stauto", stauto_cmd))
 
-        # Admin permission commands
-        application.add_handler(CommandHandler("permitlike", permitlike_cmd))
-        application.add_handler(CommandHandler("permitauto", permitauto_cmd))
-        application.add_handler(CommandHandler("rmlike", rmlike_cmd))
-        application.add_handler(CommandHandler("rmauto", rmauto_cmd))
-        
-        # Admin limit commands
-        application.add_handler(CommandHandler("setlimit", setlimit_cmd))
-        application.add_handler(CommandHandler("removelimit", removelimit_cmd))
-        application.add_handler(CommandHandler("viewlimits", viewlimits_cmd))
-        application.add_handler(CommandHandler("stats", stats_cmd))
+    # Admin permission commands
+    application.add_handler(CommandHandler("permitlike", permitlike_cmd))
+    application.add_handler(CommandHandler("permitauto", permitauto_cmd))
+    application.add_handler(CommandHandler("rmlike", rmlike_cmd))
+    application.add_handler(CommandHandler("rmauto", rmauto_cmd))
+    
+    # Admin limit commands
+    application.add_handler(CommandHandler("setlimit", setlimit_cmd))
+    application.add_handler(CommandHandler("removelimit", removelimit_cmd))
+    application.add_handler(CommandHandler("viewlimits", viewlimits_cmd))
+    application.add_handler(CommandHandler("stats", stats_cmd))
 
-        # Error handler
-        application.add_error_handler(error_handler)
+    # Error handler
+    application.add_error_handler(error_handler)
 
-        logger.info("Starting bot...")
-        application.run_polling()
-    else:
-        # For v13.x
-        updater = Updater(BOT_TOKEN, use_context=True)
-        dp = updater.dispatcher
-
-        # Command handlers
-        dp.add_handler(CommandHandler("start", start))
-        dp.add_handler(CommandHandler("help", help_cmd))
-        dp.add_handler(CommandHandler("like", like_cmd))
-        dp.add_handler(CommandHandler("auto", auto_cmd))
-        dp.add_handler(CommandHandler("myautos", myautos_cmd))
-        dp.add_handler(CommandHandler("removeauto", removeauto_cmd))
-        dp.add_handler(CommandHandler("stauto", stauto_cmd))
-
-        # Admin permission commands
-        dp.add_handler(CommandHandler("permitlike", permitlike_cmd))
-        dp.add_handler(CommandHandler("permitauto", permitauto_cmd))
-        dp.add_handler(CommandHandler("rmlike", rmlike_cmd))
-        dp.add_handler(CommandHandler("rmauto", rmauto_cmd))
-        
-        # Admin limit commands
-        dp.add_handler(CommandHandler("setlimit", setlimit_cmd))
-        dp.add_handler(CommandHandler("removelimit", removelimit_cmd))
-        dp.add_handler(CommandHandler("viewlimits", viewlimits_cmd))
-        dp.add_handler(CommandHandler("stats", stats_cmd))
-
-        # Error handler
-        dp.add_error_handler(error_handler)
-
-        logger.info("Starting bot...")
-        updater.start_polling()
-        
-        try:
-            updater.idle()
-        finally:
-            scheduler.shutdown()
-            db.close()
-            logger.info("Bot stopped")
+    logger.info("Starting bot...")
+    application.run_polling()
+    
+    try:
+        application.idle()
+    finally:
+        scheduler.shutdown()
+        db.close()
+        logger.info("Bot stopped")
 
 if __name__ == "__main__":
     main()
