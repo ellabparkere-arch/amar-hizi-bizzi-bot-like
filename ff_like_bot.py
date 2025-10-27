@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import sys
 import logging
 import sqlite3
 import requests
@@ -7,11 +8,11 @@ import threading
 import traceback
 from datetime import datetime, timezone, timedelta
 import pytz
-import asyncio
+import time
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.constants import ParseMode
-from telegram.error import TelegramError
+from telegram.error import TelegramError, RetryAfter, FloodError
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED
@@ -46,7 +47,7 @@ def get_db_connection():
     global db_connection
     if db_connection is None:
         try:
-            db_connection = sqlite3.connect(DB_PATH, check_same_thread=False)
+            db_connection = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
             logger.info("Database connection established")
         except Exception as e:
             logger.error(f"Failed to connect to database: {e}")
@@ -62,7 +63,7 @@ def init_db():
             telegram_id INTEGER PRIMARY KEY,
             permit_like INTEGER DEFAULT 0,
             permit_auto INTEGER DEFAULT 0,
-            like_limit INTEGER,   -- nullable: if NULL use default
+            like_limit INTEGER,
             auto_limit INTEGER,
             daily_likes_used INTEGER DEFAULT 0,
             daily_autos_used INTEGER DEFAULT 0,
@@ -339,7 +340,7 @@ def run_all_active_autos_once(context=None):
                 results.append((id_, uid, success, resp))
                 
                 # Small delay to avoid rate limiting
-                time.sleep(0.5)
+                time.sleep(1)
             except Exception as e:
                 logger.error(f"Error processing auto task {id_}: {e}")
                 results.append((id_, uid, False, str(e)))
@@ -584,18 +585,24 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Only admins can check bot status.")
             return
         
+        # Check database connection
+        db_status = "Connected"
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            cur.fetchone()
+        except:
+            db_status = "Disconnected"
+        
         status_text = (
             "🤖 Bot Status Report\n\n"
             f"✅ Bot is running\n"
             f"⏰ Current time: {datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"📅 Scheduler status: {'Running' if scheduler.running else 'Stopped'}\n"
-            f"🗄️ Database: {'Connected' if db_connection else 'Disconnected'}\n"
-            f"🔧 Python version: {os.sys.version}\n"
-            f"📦 Library versions:\n"
-            f"   - python-telegram-bot: {telegram.__version__}\n"
-            f"   - requests: {requests.__version__}\n"
-            f"   - APScheduler: {apscheduler.__version__}\n"
-            f"   - pytz: {pytz.__version__}"
+            f"🗄️ Database: {db_status}\n"
+            f"🔧 Python version: {sys.version.split()[0]}\n"
+            f"📦 Active jobs: {len(scheduler.get_jobs())}"
         )
         
         await update.message.reply_text(status_text)
