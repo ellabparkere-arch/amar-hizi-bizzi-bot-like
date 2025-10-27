@@ -725,7 +725,7 @@ async def run_auto_like_tasks_job_manual(context: ContextTypes.DEFAULT_TYPE):
 def main():
     """Starts the bot."""
     # Check for config
-    if BOT_TOKEN == "7954465134:AAF2LznZZuCbTJM-2mJEdU5A5K4jKf5f0_8" or not ADMIN_IDS:
+    if BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN" or not ADMIN_IDS:
         logger.critical("!!! BOT_TOKEN or ADMIN_IDS are not set in bot.py! Please fill them and restart. !!!")
         return
 
