@@ -1,0 +1,6 @@
+services:
+  - type: worker
+    name: ff-like-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python ff_like_bot.py
