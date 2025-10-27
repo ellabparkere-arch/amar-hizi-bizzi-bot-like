@@ -15,7 +15,7 @@ ADMIN_IDS = [123456789, 987654321]  # Replace with your numeric Telegram ID(s)
 
 API_URL = "https://yunus-bhai-like-ff.vercel.app/like"
 API_KEY = "gst"
-DB_NAME = "bot_data.db"  # This file will store all user and task data
+DB_NAME = "/data/bot_data.db"  # This file will store all user and task data
 LIKE_DEFAULT_LIMIT = 3
 BD_TZ = pytz.timezone("Asia/Dhaka")
 
@@ -757,3 +757,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
