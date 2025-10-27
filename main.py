@@ -1,9 +1,12 @@
 import os
 import logging
 import sqlite3
-import request
+import json
 from datetime import datetime, time
 from typing import Optional
+from urllib.parse import urlencode
+from urllib.request import urlopen, Request
+from urllib.error import URLError, HTTPError
 
 from pytz import timezone
 from aiohttp import web
@@ -26,11 +29,11 @@ DB_PATH = os.getenv("DB_PATH", "data.db")
 TZ = timezone("Asia/Dhaka")
 
 # Webhook config (Render Web Service)
-WEBHOOK_BASE = os.getenv("WEBHOOK_BASE")  # e.g. https://amar-hizi-bizzi-bot-like-1.onrender.com
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")  # random strong string
+WEBHOOK_BASE = os.getenv("WEBHOOK_BASE")  # e.g. https://your-service.onrender.com
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")  # set a strong value
 PORT = int(os.getenv("PORT", "10000"))
 HOST = "0.0.0.0"
-WEBHOOK_PATH = f"/{BOT_TOKEN}"  # unique path; Telegram will POST here
+WEBHOOK_PATH = f"/{BOT_TOKEN}"   # Telegram will POST here
 HEALTH_PATH = "/healthz"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -91,27 +94,37 @@ def extend_task_days(uid: str, delta_days: int) -> Optional[int]:
         return new_days
 
 # ----------------------------
-# Like API
+# Like API (urllib → no external dep)
 # ----------------------------
 def call_like_api(uid: str) -> (bool, str):
+    """
+    Returns (ok, message)
+    """
+    qs = urlencode({"uid": uid, "server_name": SERVER_NAME, "key": LIKE_API_KEY})
+    url = f"{LIKE_API_BASE}?{qs}"
+    req = Request(url, headers={"User-Agent": "ff-like-bot/1.0"})
     try:
-        r = requests.get(
-            LIKE_API_BASE,
-            params={"uid": uid, "server_name": SERVER_NAME, "key": LIKE_API_KEY},
-            timeout=20
-        )
+        with urlopen(req, timeout=20) as resp:
+            status = resp.getcode()
+            body = resp.read().decode("utf-8", errors="replace")
+            # try JSON first
+            try:
+                data = json.loads(body)
+                success = bool(data.get("success", 200 <= status < 300))
+                msg = data.get("message") or data.get("msg") or body[:200]
+                return success, msg
+            except json.JSONDecodeError:
+                return (200 <= status < 300), (body[:200] if body else f"HTTP {status}")
+    except HTTPError as e:
         try:
-            data = r.json()
-            success = bool(data.get("success", r.ok))
-            msg = data.get("message") or data.get("msg") or str(data)
-            return success, msg
+            detail = e.read().decode("utf-8", errors="replace")
         except Exception:
-            if r.ok:
-                return True, f"OK: {r.text[:200]}"
-            else:
-                return False, f"HTTP {r.status_code}: {r.text[:200]}"
-    except requests.RequestException as e:
-        return False, f"Network error: {e}"
+            detail = ""
+        return False, f"HTTP {e.code}: {detail[:200]}"
+    except URLError as e:
+        return False, f"Network error: {e.reason}"
+    except Exception as e:
+        return False, f"Unexpected error: {e}"
 
 # ----------------------------
 # Helpers
@@ -259,9 +272,7 @@ async def health_handler(_request):
 
 def make_web_app(application: Application) -> web.Application:
     app = web.Application()
-    # Telegram webhook will be attached by PTB; we add health
-    app.router.add_get(HEALTH_PATH, health_handler)
-    # PTB attaches POST route at WEBHOOK_PATH internally
+    app.router.add_get(HEALTH_PATH, health_handler)  # health endpoint
     return app
 
 def main():
@@ -288,10 +299,10 @@ def main():
         name="auto-like-daily",
     )
 
-    # Build the webhook URL
+    # Build webhook URL
     webhook_url = WEBHOOK_BASE.rstrip("/") + WEBHOOK_PATH
 
-    # Start webhook server (PTB will set the webhook and add POST route)
+    # Start webhook server (PTB will set webhook and add POST route)
     web_app = make_web_app(application)
     application.run_webhook(
         listen=HOST,
@@ -305,4 +316,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
