@@ -1,7 +1,7 @@
 import os
 import logging
 import sqlite3
-import requests
+import request
 from datetime import datetime, time
 from typing import Optional
 
@@ -305,3 +305,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
