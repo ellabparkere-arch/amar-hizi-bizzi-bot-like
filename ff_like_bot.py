@@ -1,561 +1,250 @@
 import logging
+import sqlite3
 import requests
-import schedule
-import time
+import threading
 from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Updater, CommandHandler, MessageHandler, filters, CallbackContext, CallbackQueryHandler
-import json
-import os
-from pytz import timezone
+import pytz
+from telegram import Update, ParseMode
+from telegram.ext import Updater, CommandHandler, CallbackContext
 
-# বট টোকেন এবং অ্যাডমিন আইডি সেট করুন
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # এখানে আপনার টেলিগ্রাম বট টোকেন দিন
-ADMIN_IDS = [123456789]  # এখানে আপনার টেলিগ্রাম আইডি দিন (একাধিক অ্যাডমিন হলে কমা দিয়ে আলাদা করুন)
+# --- CONFIGURATION ---
+# !!! ⛔️ PLEASE FILL THESE VALUES ⛔️ !!!
+BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"  # Get this from BotFather on Telegram
+ADMIN_IDS = [123456789, 987654321]  # Replace with your numeric Telegram ID(s)
+# !!! ⛔️ PLEASE FILL THESE VALUES ⛔️ !!!
 
-# লগিং সেটআপ
+API_URL = "https://yunus-bhai-like-ff.vercel.app/like"
+API_KEY = "gst"
+DB_NAME = "bot_data.db"  # This file will store all user and task data
+LIKE_DEFAULT_LIMIT = 3
+BD_TZ = pytz.timezone("Asia/Dhaka")
+
+# Setup logging
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ফাইল থেকে ডেটা লোড করার ফাংশন
-def load_data():
-    data = {
-        "users": {},
-        "auto_likes": {},
-        "permissions": {
-            "like": {},
-            "auto": {}
-        },
-        "limits": {},
-        "stats": {
-            "total_likes": 0,
-            "total_auto_likes": 0,
-            "failed_likes": 0
-        }
-    }
-    
-    if os.path.exists('bot_data.json'):
+# --- DATABASE ---
+
+def get_db_connection():
+    """Establishes a connection to the SQLite database."""
+    try:
+        conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
+    except sqlite3.Error as e:
+        logger.error(f"Database connection error: {e}")
+        return None
+
+def init_db():
+    """Initializes the database and creates tables if they don't exist."""
+    conn = get_db_connection()
+    if conn:
         try:
-            with open('bot_data.json', 'r') as f:
-                data = json.load(f)
-        except Exception as e:
-            logger.error(f"Error loading data: {e}")
+            with conn:
+                conn.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    telegram_id INTEGER PRIMARY KEY,
+                    has_like_permission BOOLEAN DEFAULT 0,
+                    has_auto_permission BOOLEAN DEFAULT 0,
+                    daily_like_count INTEGER DEFAULT 0,
+                    last_like_date TEXT DEFAULT ''
+                )
+                ''')
+                conn.execute('''
+                CREATE TABLE IF NOT EXISTS limits (
+                    telegram_id INTEGER,
+                    type TEXT,
+                    limit_value INTEGER,
+                    PRIMARY KEY (telegram_id, type)
+                )
+                ''')
+                conn.execute('''
+                CREATE TABLE IF NOT EXISTS auto_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_telegram_id INTEGER,
+                    target_uid TEXT,
+                    end_date TEXT,
+                    UNIQUE(user_telegram_id, target_uid)
+                )
+                ''')
+            logger.info("Database initialized successfully.")
+        except sqlite3.Error as e:
+            logger.error(f"Database initialization error: {e}")
+        finally:
+            conn.close()
+
+# --- HELPER FUNCTIONS ---
+
+def is_admin(user_id):
+    """Checks if a user is an admin."""
+    return user_id in ADMIN_IDS
+
+def check_permission(user_id, perm_type):
+    """Checks if a user has a specific permission ('like' or 'auto')."""
+    if is_admin(user_id):
+        return True
     
-    return data
-
-# ডেটা ফাইলে সেভ করার ফাংশন
-def save_data(data):
+    conn = get_db_connection()
+    if not conn:
+        return False
+        
     try:
-        with open('bot_data.json', 'w') as f:
-            json.dump(data, f)
-    except Exception as e:
-        logger.error(f"Error saving data: {e}")
+        with conn:
+            query = f"SELECT has_{perm_type}_permission FROM users WHERE telegram_id = ?"
+            user = conn.execute(query, (user_id,)).fetchone()
+            if user and user[f'has_{perm_type}_permission']:
+                return True
+    except sqlite3.Error as e:
+        logger.error(f"Error checking permission for {user_id}: {e}")
+    finally:
+        conn.close()
+    return False
 
-# ডেটা লোড করুন
-bot_data = load_data()
-
-# লাইক পাঠানোর ফাংশন
-def send_like(uid):
+def get_limit(user_id, limit_type):
+    """Gets the custom limit for a user, or returns the default."""
+    conn = get_db_connection()
+    if not conn:
+        return LIKE_DEFAULT_LIMIT  # Fallback
+        
+    limit = LIKE_DEFAULT_LIMIT
     try:
-        url = f"https://yunus-bhai-like-ff.vercel.app/like?uid={uid}&server_name=bd&key=gst"
-        response = requests.get(url)
+        with conn:
+            custom_limit = conn.execute(
+                "SELECT limit_value FROM limits WHERE telegram_id = ? AND type = ?",
+                (user_id, limit_type)
+            ).fetchone()
+            
+            if custom_limit:
+                limit = custom_limit['limit_value']
+    except sqlite3.Error as e:
+        logger.error(f"Error getting limit for {user_id}: {e}")
+    finally:
+        conn.close()
+    
+    return limit
+
+def check_like_limit(user_id):
+    """
+    Checks if a user is within their daily like limit.
+    Resets the limit if it's a new day.
+    Returns (True, "Message")
+    """
+    conn = get_db_connection()
+    if not conn:
+        return (False, "Bot database error. Please try again later.")
+
+    today_str = datetime.now(BD_TZ).strftime('%Y-%m-%d')
+    limit = get_limit(user_id, 'like')
+    
+    try:
+        with conn:
+            user = conn.execute("SELECT daily_like_count, last_like_date FROM users WHERE telegram_id = ?", (user_id,)).fetchone()
+            
+            if not user:
+                # User not in DB, but passed permission check (must be admin)
+                # Add them to DB to track limits
+                conn.execute("INSERT INTO users (telegram_id) VALUES (?)", (user_id,))
+                return (True, "Limit OK")
+
+            last_like_date = user['last_like_date']
+            daily_like_count = user['daily_like_count']
+
+            if last_like_date != today_str:
+                # It's a new day, reset the count
+                conn.execute("UPDATE users SET daily_like_count = 0, last_like_date = ? WHERE telegram_id = ?", (today_str, user_id))
+                return (True, "Limit OK")
+            
+            if daily_like_count >= limit:
+                return (False, f"You have reached your daily like limit of {limit}.")
+            
+            return (True, "Limit OK")
+            
+    except sqlite3.Error as e:
+        logger.error(f"Error checking limit for {user_id}: {e}")
+        return (False, "Error checking your like limit.")
+    finally:
+        conn.close()
+
+def increment_like_count(user_id):
+    """Increments the user's daily like count."""
+    conn = get_db_connection()
+    if not conn:
+        return
+
+    today_str = datetime.now(BD_TZ).strftime('%Y-%m-%d')
+    try:
+        with conn:
+            # Ensure date is also set, in case it's their first like of the day
+            conn.execute(
+                "UPDATE users SET daily_like_count = daily_like_count + 1, last_like_date = ? WHERE telegram_id = ?",
+                (today_str, user_id)
+            )
+    except sqlite3.Error as e:
+        logger.error(f"Error incrementing limit for {user_id}: {e}")
+    finally:
+        conn.close()
+
+def call_like_api(uid):
+    """
+    Calls the Free Fire Like API.
+    Returns (success, message)
+    """
+    params = {
+        "uid": uid,
+        "server_name": "bd",
+        "key": API_KEY
+    }
+    try:
+        response = requests.get(API_URL, params=params, timeout=10)
+        
         if response.status_code == 200:
-            result = response.json()
-            if result.get('success', False):
-                bot_data["stats"]["total_likes"] += 1
-                save_data(bot_data)
-                return True, "Like sent successfully!"
-            else:
-                bot_data["stats"]["failed_likes"] += 1
-                save_data(bot_data)
-                return False, f"Failed to send like: {result.get('message', 'Unknown error')}"
-        else:
-            bot_data["stats"]["failed_likes"] += 1
-            save_data(bot_data)
-            return False, f"API request failed with status code: {response.status_code}"
-    except Exception as e:
-        bot_data["stats"]["failed_likes"] += 1
-        save_data(bot_data)
-        return False, f"Error sending like: {str(e)}"
-
-# /like কমান্ড হ্যান্ডলার
-def like_command(update: Update, context: CallbackContext):
-    user_id = update.effective_user.id
-    
-    # চেক করুন ইউজারের লাইক পারমিশন আছে কিনা
-    if str(user_id) not in bot_data["permissions"]["like"] and user_id not in ADMIN_IDS:
-        update.message.reply_text("You don't have permission to use this command.")
-        return
-    
-    # চেক করুন ইউজার আজকের লিমিট পার করেছে কিনা
-    today = datetime.now().strftime("%Y-%m-%d")
-    if str(user_id) not in bot_data["users"]:
-        bot_data["users"][str(user_id)] = {"likes": {}, "date": today}
-    
-    if bot_data["users"][str(user_id)]["date"] != today:
-        bot_data["users"][str(user_id)] = {"likes": {}, "date": today}
-    
-    if str(user_id) in bot_data["limits"] and "like" in bot_data["limits"][str(user_id)]:
-        like_limit = bot_data["limits"][str(user_id)]["like"]
-    else:
-        like_limit = 3  # ডিফল্ট লিমিট
-    
-    if len(bot_data["users"][str(user_id)]["likes"]) >= like_limit:
-        update.message.reply_text(f"You have reached your daily like limit of {like_limit}.")
-        return
-    
-    # ইউআইডি প্যারামিটার চেক করুন
-    if not context.args:
-        update.message.reply_text("Please provide a UID.\nExample: /like 1234567890")
-        return
-    
-    uid = context.args[0]
-    
-    # লাইক পাঠান
-    success, message = send_like(uid)
-    
-    if success:
-        bot_data["users"][str(user_id)]["likes"][uid] = datetime.now().strftime("%H:%M:%S")
-        save_data(bot_data)
-        update.message.reply_text(f"✅ {message}\nUID: {uid}")
-    else:
-        update.message.reply_text(f"❌ {message}")
-
-# /auto কমান্ড হ্যান্ডলার (শুধুমাত্র অ্যাডমিন)
-def auto_command(update: Update, context: CallbackContext):
-    user_id = update.effective_user.id
-    
-    if user_id not in ADMIN_IDS:
-        update.message.reply_text("This command is for admins only.")
-        return
-    
-    # প্যারামিটার চেক করুন
-    if len(context.args) < 2:
-        update.message.reply_text("Please provide UID and number of days.\nExample: /auto 8385763215 30")
-        return
-    
-    uid = context.args[0]
-    
-    try:
-        days = int(context.args[1])
-        if days <= 0:
-            raise ValueError
-    except ValueError:
-        update.message.reply_text("Please provide a valid number of days (positive integer).")
-        return
-    
-    # অটো লাইক সেট করুন
-    if uid not in bot_data["auto_likes"]:
-        bot_data["auto_likes"][uid] = {}
-    
-    # যদি কোনো ইউজারের মেসেজের রিপ্লাই দিয়ে কমান্ড দেওয়া হয়
-    if update.message.reply_to_message:
-        target_user_id = update.message.reply_to_message.from_user.id
-        
-        # ইউজারের অটো লাইক পারমিশন চেক করুন
-        if str(target_user_id) not in bot_data["permissions"]["auto"] and target_user_id not in ADMIN_IDS:
-            update.message.reply_text("This user doesn't have auto like permission.")
-            return
-        
-        # ইউজারের অটো লাইক লিমিট চেক করুন
-        if str(target_user_id) in bot_data["limits"] and "auto" in bot_data["limits"][str(target_user_id)]:
-            auto_limit = bot_data["limits"][str(target_user_id)]["auto"]
-        else:
-            auto_limit = 1  # ডিফল্ট অটো লাইক লিমিট
-        
-        # ইউজারের বর্তমান অটো লাইক সংখ্যা চেক করুন
-        user_auto_count = sum(1 for task in bot_data["auto_likes"].values() if task.get("user_id") == target_user_id)
-        
-        if user_auto_count >= auto_limit:
-            update.message.reply_text(f"This user has reached their auto like limit of {auto_limit}.")
-            return
-        
-        bot_data["auto_likes"][uid] = {
-            "user_id": target_user_id,
-            "days": days,
-            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "last_run": None,
-            "active": True
-        }
-        
-        update.message.reply_text(f"✅ Auto like set for UID: {uid} for {days} days.\nUser: @{update.message.reply_to_message.from_user.username}")
-    else:
-        bot_data["auto_likes"][uid] = {
-            "user_id": user_id,
-            "days": days,
-            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "last_run": None,
-            "active": True
-        }
-        
-        update.message.reply_text(f"✅ Auto like set for UID: {uid} for {days} days.")
-    
-    save_data(bot_data)
-
-# /myautos কমান্ড হ্যান্ডলার
-def myautos_command(update: Update, context: CallbackContext):
-    user_id = update.effective_user.id
-    
-    # ইউজারের অটো লাইক টাস্ক খুঁজুন
-    user_autos = []
-    for uid, task in bot_data["auto_likes"].items():
-        if task.get("user_id") == user_id and task.get("active", False):
-            remaining_days = task["days"]
-            
-            # যদি টাস্কটি আগে রান করা হয়ে থাকে, তাহলে অবশিষ্ট দিন হিসাব করুন
-            if task.get("last_run"):
-                last_run_date = datetime.strptime(task["last_run"], "%Y-%m-%d")
-                days_passed = (datetime.now() - last_run_date).days
-                remaining_days = max(0, task["days"] - days_passed)
-            
-            user_autos.append({
-                "uid": uid,
-                "days": remaining_days,
-                "created_at": task["created_at"]
-            })
-    
-    if not user_autos:
-        update.message.reply_text("You don't have any active auto like tasks.")
-        return
-    
-    message = "Your active auto like tasks:\n\n"
-    for auto in user_autos:
-        message += f"UID: {auto['uid']}\n"
-        message += f"Remaining days: {auto['days']}\n"
-        message += f"Created at: {auto['created_at']}\n\n"
-    
-    update.message.reply_text(message)
-
-# /removeauto কমান্ড হ্যান্ডলার
-def removeauto_command(update: Update, context: CallbackContext):
-    user_id = update.effective_user.id
-    
-    if not context.args:
-        update.message.reply_text("Please provide a UID.\nExample: /removeauto 1234567890")
-        return
-    
-    uid = context.args[0]
-    
-    if uid not in bot_data["auto_likes"]:
-        update.message.reply_text("No auto like task found for this UID.")
-        return
-    
-    # চেক করুন ইউজার এই টাস্কের মালিক কিনা বা অ্যাডমিন কিনা
-    if bot_data["auto_likes"][uid].get("user_id") != user_id and user_id not in ADMIN_IDS:
-        update.message.reply_text("You don't have permission to remove this auto like task.")
-        return
-    
-    # টাস্ক ডিলিট করুন
-    del bot_data["auto_likes"][uid]
-    save_data(bot_data)
-    
-    update.message.reply_text(f"✅ Auto like task removed for UID: {uid}")
-
-# /stauto কমান্ড হ্যান্ডলার (শুধুমাত্র অ্যাডমিন)
-def stauto_command(update: Update, context: CallbackContext):
-    user_id = update.effective_user.id
-    
-    if user_id not in ADMIN_IDS:
-        update.message.reply_text("This command is for admins only.")
-        return
-    
-    update.message.reply_text("Starting auto like process manually...")
-    
-    # অটো লাইক প্রসেস চালু করুন
-    run_auto_likes(context.bot)
-
-# অটো লাইক প্রসেস ফাংশন
-def run_auto_likes(bot):
-    bd_timezone = timezone('Asia/Dhaka')
-    now = datetime.now(bd_timezone)
-    today = now.strftime("%Y-%m-%d")
-    
-    completed_tasks = []
-    failed_tasks = []
-    
-    for uid, task in list(bot_data["auto_likes"].items()):
-        if not task.get("active", False):
-            continue
-        
-        # চেক করুন টাস্কটি আজকে ইতিমধ্যে রান করা হয়েছে কিনা
-        if task.get("last_run") == today:
-            continue
-        
-        # চেক করুন দিন শেষ হয়েছে কিনা
-        if task.get("last_run"):
-            last_run_date = datetime.strptime(task["last_run"], "%Y-%m-%d")
-            days_passed = (datetime.now(bd_timezone) - last_run_date).days
-            
-            if days_passed >= task["days"]:
-                # টাস্ক নিষ্ক্রিয় করুন
-                task["active"] = False
-                save_data(bot_data)
-                continue
-        
-        # লাইক পাঠান
-        success, message = send_like(uid)
-        
-        if success:
-            task["last_run"] = today
-            bot_data["stats"]["total_auto_likes"] += 1
-            completed_tasks.append(uid)
-            
-            # ইউজারকে নোটিফিকেশন পাঠান
-            user_id = task.get("user_id")
-            if user_id:
-                try:
-                    bot.send_message(
-                        chat_id=user_id,
-                        text=f"✅ Auto like sent successfully!\nUID: {uid}\nTime: {now.strftime('%H:%M:%S')}"
-                    )
-                except Exception as e:
-                    logger.error(f"Error sending notification to user {user_id}: {e}")
-        else:
-            failed_tasks.append({"uid": uid, "reason": message})
-        
-        save_data(bot_data)
-    
-    # অ্যাডমিনদের রিপোর্ট পাঠান
-    if completed_tasks or failed_tasks:
-        report = "Auto Like Process Report:\n\n"
-        
-        if completed_tasks:
-            report += f"✅ Successfully sent likes to {len(completed_tasks)} UIDs:\n"
-            report += ", ".join(completed_tasks) + "\n\n"
-        
-        if failed_tasks:
-            report += f"❌ Failed to send likes to {len(failed_tasks)} UIDs:\n"
-            for task in failed_tasks:
-                report += f"UID: {task['uid']}, Reason: {task['reason']}\n"
-        
-        for admin_id in ADMIN_IDS:
             try:
-                bot.send_message(chat_id=admin_id, text=report)
-            except Exception as e:
-                logger.error(f"Error sending report to admin {admin_id}: {e}")
-
-# সকাল ৭টায় অটো লাইক সেট করার ফাংশন
-def scheduled_auto_likes(context: CallbackContext):
-    run_auto_likes(context.bot)
-
-# /permitlike কমান্ড হ্যান্ডলার (শুধুমাত্র অ্যাডমিন)
-def permitlike_command(update: Update, context: CallbackContext):
-    user_id = update.effective_user.id
-    
-    if user_id not in ADMIN_IDS:
-        update.message.reply_text("This command is for admins only.")
-        return
-    
-    if not update.message.reply_to_message:
-        update.message.reply_text("Please reply to a user's message to grant like permission.")
-        return
-    
-    target_user_id = update.message.reply_to_message.from_user.id
-    bot_data["permissions"]["like"][str(target_user_id)] = True
-    save_data(bot_data)
-    
-    update.message.reply_text(f"✅ Like permission granted to user: @{update.message.reply_to_message.from_user.username}")
-
-# /permitauto কমান্ড হ্যান্ডলার (শুধুমাত্র অ্যাডমিন)
-def permitauto_command(update: Update, context: CallbackContext):
-    user_id = update.effective_user.id
-    
-    if user_id not in ADMIN_IDS:
-        update.message.reply_text("This command is for admins only.")
-        return
-    
-    if not update.message.reply_to_message:
-        update.message.reply_text("Please reply to a user's message to grant auto like permission.")
-        return
-    
-    target_user_id = update.message.reply_to_message.from_user.id
-    bot_data["permissions"]["auto"][str(target_user_id)] = True
-    save_data(bot_data)
-    
-    update.message.reply_text(f"✅ Auto like permission granted to user: @{update.message.reply_to_message.from_user.username}")
-
-# /rmlike কমান্ড হ্যান্ডলার (শুধুমাত্র অ্যাডমিন)
-def rmlike_command(update: Update, context: CallbackContext):
-    user_id = update.effective_user.id
-    
-    if user_id not in ADMIN_IDS:
-        update.message.reply_text("This command is for admins only.")
-        return
-    
-    if not update.message.reply_to_message:
-        update.message.reply_text("Please reply to a user's message to remove like permission.")
-        return
-    
-    target_user_id = update.message.reply_to_message.from_user.id
-    
-    if str(target_user_id) in bot_data["permissions"]["like"]:
-        del bot_data["permissions"]["like"][str(target_user_id)]
-        save_data(bot_data)
-        update.message.reply_text(f"✅ Like permission removed from user: @{update.message.reply_to_message.from_user.username}")
-    else:
-        update.message.reply_text("This user doesn't have like permission.")
-
-# /rmauto কমান্ড হ্যান্ডলার (শুধুমাত্র অ্যাডমিন)
-def rmauto_command(update: Update, context: CallbackContext):
-    user_id = update.effective_user.id
-    
-    if user_id not in ADMIN_IDS:
-        update.message.reply_text("This command is for admins only.")
-        return
-    
-    if not update.message.reply_to_message:
-        update.message.reply_text("Please reply to a user's message to remove auto like permission.")
-        return
-    
-    target_user_id = update.message.reply_to_message.from_user.id
-    
-    if str(target_user_id) in bot_data["permissions"]["auto"]:
-        del bot_data["permissions"]["auto"][str(target_user_id)]
-        save_data(bot_data)
-        update.message.reply_text(f"✅ Auto like permission removed from user: @{update.message.reply_to_message.from_user.username}")
-    else:
-        update.message.reply_text("This user doesn't have auto like permission.")
-
-# /setlimit কমান্ড হ্যান্ডলার (শুধুমাত্র অ্যাডমিন)
-def setlimit_command(update: Update, context: CallbackContext):
-    user_id = update.effective_user.id
-    
-    if user_id not in ADMIN_IDS:
-        update.message.reply_text("This command is for admins only.")
-        return
-    
-    if len(context.args) < 3:
-        update.message.reply_text("Please provide telegram_id, type (like/auto), and limit.\nExample: /setlimit 123456789 like 5")
-        return
-    
-    try:
-        target_user_id = int(context.args[0])
-        limit_type = context.args[1].lower()
-        limit = int(context.args[2])
-        
-        if limit_type not in ["like", "auto"]:
-            update.message.reply_text("Type must be either 'like' or 'auto'.")
-            return
-        
-        if limit <= 0:
-            update.message.reply_text("Limit must be a positive integer.")
-            return
-        
-        if str(target_user_id) not in bot_data["limits"]:
-            bot_data["limits"][str(target_user_id)] = {}
-        
-        bot_data["limits"][str(target_user_id)][limit_type] = limit
-        save_data(bot_data)
-        
-        update.message.reply_text(f"✅ {limit_type.capitalize()} limit set to {limit} for user ID: {target_user_id}")
-    except ValueError:
-        update.message.reply_text("Please provide valid telegram_id and limit (positive integers).")
-
-# /removelimit কমান্ড হ্যান্ডলার (শুধুমাত্র অ্যাডমিন)
-def removelimit_command(update: Update, context: CallbackContext):
-    user_id = update.effective_user.id
-    
-    if user_id not in ADMIN_IDS:
-        update.message.reply_text("This command is for admins only.")
-        return
-    
-    if len(context.args) < 2:
-        update.message.reply_text("Please provide telegram_id and type (like/auto).\nExample: /removelimit 123456789 like")
-        return
-    
-    try:
-        target_user_id = int(context.args[0])
-        limit_type = context.args[1].lower()
-        
-        if limit_type not in ["like", "auto"]:
-            update.message.reply_text("Type must be either 'like' or 'auto'.")
-            return
-        
-        if str(target_user_id) in bot_data["limits"] and limit_type in bot_data["limits"][str(target_user_id)]:
-            del bot_data["limits"][str(target_user_id)][limit_type]
-            
-            # যদি ইউজারের আর কোনো লিমিট না থাকে, তাহলে ইউজারকে লিমিট ডিকশনারি থেকে সরান
-            if not bot_data["limits"][str(target_user_id)]:
-                del bot_data["limits"][str(target_user_id)]
-            
-            save_data(bot_data)
-            update.message.reply_text(f"✅ {limit_type.capitalize()} limit removed for user ID: {target_user_id}")
+                data = response.json()
+                # Adapt this based on the *actual* API response
+                if data.get("status") == "success" or "Successfully" in data.get("message", ""):
+                    return (True, data.get("message", "Like sent successfully!"))
+                else:
+                    return (False, data.get("message", "API returned an unknown error."))
+            except requests.exceptions.JSONDecodeError:
+                return (False, "API returned invalid JSON response.")
         else:
-            update.message.reply_text(f"No {limit_type} limit found for user ID: {target_user_id}")
-    except ValueError:
-        update.message.reply_text("Please provide a valid telegram_id (positive integer).")
+            return (False, f"API request failed with status code {response.status_code}.")
+            
+    except requests.exceptions.RequestException as e:
+        logger.error(f"API call error for UID {uid}: {e}")
+        return (False, f"Request failed: {e}")
 
-# /viewlimits কমান্ড হ্যান্ডলার (শুধুমাত্র অ্যাডমিন)
-def viewlimits_command(update: Update, context: CallbackContext):
-    user_id = update.effective_user.id
-    
-    if user_id not in ADMIN_IDS:
-        update.message.reply_text("This command is for admins only.")
-        return
-    
-    if not bot_data["limits"]:
-        update.message.reply_text("No custom limits set.")
-        return
-    
-    message = "Custom Limits:\n\n"
-    for user_id_str, limits in bot_data["limits"].items():
-        message += f"User ID: {user_id_str}\n"
-        if "like" in limits:
-            message += f"  Like limit: {limits['like']}\n"
-        if "auto" in limits:
-            message += f"  Auto like limit: {limits['auto']}\n"
-        message += "\n"
-    
-    update.message.reply_text(message)
+# --- BOT COMMANDS ---
 
-# /stats কমান্ড হ্যান্ডলার (শুধুমাত্র অ্যাডমিন)
-def stats_command(update: Update, context: CallbackContext):
-    user_id = update.effective_user.id
-    
-    if user_id not in ADMIN_IDS:
-        update.message.reply_text("This command is for admins only.")
-        return
-    
-    stats = bot_data["stats"]
-    active_auto_tasks = sum(1 for task in bot_data["auto_likes"].values() if task.get("active", False))
-    
-    message = "Bot Statistics:\n\n"
-    message += f"Total likes sent: {stats['total_likes']}\n"
-    message += f"Total auto likes sent: {stats['total_auto_likes']}\n"
-    message += f"Failed likes: {stats['failed_likes']}\n"
-    message += f"Active auto like tasks: {active_auto_tasks}\n"
-    message += f"Users with like permission: {len(bot_data['permissions']['like'])}\n"
-    message += f"Users with auto like permission: {len(bot_data['permissions']['auto'])}"
-    
-    update.message.reply_text(message)
+def start(update: Update, context: CallbackContext):
+    """Handles the /start command."""
+    update.message.reply_text(
+        "Welcome to the Free Fire Auto Like Bot!\n"
+        "Type /help to see the list of commands."
+    )
 
-# /help কমান্ড হ্যান্ডলার
 def help_command(update: Update, context: CallbackContext):
-    user_id = update.effective_user.id
-    
+    """Handles the /help command."""
     help_text = """
-Free Fire Auto Like Bot
+<b>Free Fire Auto Like Bot</b>
 
 /like <uid> - Send like (requires permission)
-Example: /like 1234567890
-/auto <uid> <days> - Set up auto like (admin only)
-Example: /auto 8385763215 30
+Example: <code>/like 1234567890</code>
+
+/auto <uid> <days> - Set up auto like (requires permission)
+Example: <code>/auto 8385763215 30</code>
+
 /myautos - View your active auto like tasks
 /removeauto <uid> - Remove an auto like task
-/stauto - Start auto like process manually (admin only)
 
 Auto like tasks run daily at 7:00 AM Bangladesh Time (UTC+6)
-
-Note: If an admin sets auto like by replying to a user's message,
-that user's like limit will be reduced by 1.
 """
     
-    if user_id in ADMIN_IDS:
+    if is_admin(update.effective_user.id):
         help_text += """
-Admin Commands:
+<b>Admin Commands:</b>
 /permitlike - Grant like permission (reply to user)
 /permitauto - Grant auto like permission (reply to user)
 /rmlike - Remove like permission (reply to user)
@@ -564,79 +253,507 @@ Admin Commands:
 /removelimit <telegram_id> <like|auto> - Remove custom limit
 /viewlimits - View all custom limits
 /stats - View bot statistics
-
-➤ Default like limit: 3/day (if permitted)
-➤ Auto like tasks run daily at 7 AM Bangladesh Time
+/stauto - Start auto like process manually
 """
-    
-    update.message.reply_text(help_text)
+    update.message.reply_html(help_text)
 
-# স্টার্ট কমান্ড হ্যান্ডলার
-def start_command(update: Update, context: CallbackContext):
+def like(update: Update, context: CallbackContext):
+    """Handles the /like command."""
     user_id = update.effective_user.id
     
-    welcome_text = f"""
-Welcome to Free Fire Auto Like Bot, {update.effective_user.first_name}!
+    if not check_permission(user_id, 'like'):
+        update.message.reply_text("You do not have permission to use this command.")
+        return
 
-Use /help to see all available commands.
+    if not context.args:
+        update.message.reply_text("Usage: /like <uid>\nExample: <code>/like 1234567890</code>", parse_mode=ParseMode.HTML)
+        return
+        
+    uid = context.args[0]
+    if not uid.isdigit():
+        update.message.reply_text("Invalid UID. It should only contain numbers.")
+        return
 
-Note: You need permission to use this bot. Contact an admin for access.
-"""
+    # Check limit
+    can_like, message = check_like_limit(user_id)
+    if not can_like:
+        update.message.reply_text(message)
+        return
+        
+    msg = update.message.reply_text(f"Sending like to UID {uid}...")
     
-    update.message.reply_text(welcome_text)
-
-# ইরর হ্যান্ডলার
-def error_handler(update: Update, context: CallbackContext):
-    logger.error(f"Update {update} caused error {context.error}")
+    success, api_message = call_like_api(uid)
     
-    # অ্যাডমিনদের ইরর নোটিফিকেশন পাঠান
-    for admin_id in ADMIN_IDS:
-        try:
-            context.bot.send_message(
-                chat_id=admin_id,
-                text=f"⚠️ Bot Error:\n\nUpdate: {update}\nError: {context.error}"
+    if success:
+        increment_like_count(user_id)
+        msg.edit_text(f"✅ Success! UID: {uid}\nResponse: {api_message}")
+    else:
+        msg.edit_text(f"❌ Failed! UID: {uid}\nReason: {api_message}")
+
+def auto(update: Update, context: CallbackContext):
+    """Handles the /auto command."""
+    user_id = update.effective_user.id
+    
+    if not check_permission(user_id, 'auto'):
+        update.message.reply_text("You do not have permission to set up auto likes.")
+        return
+
+    if len(context.args) != 2:
+        update.message.reply_text("Usage: /auto <uid> <days>\nExample: <code>/auto 1234567890 30</code>", parse_mode=ParseMode.HTML)
+        return
+
+    uid = context.args[0]
+    days_str = context.args[1]
+
+    if not uid.isdigit():
+        update.message.reply_text("Invalid UID. It should only contain numbers.")
+        return
+        
+    try:
+        days = int(days_str)
+        if days <= 0:
+            raise ValueError
+    except ValueError:
+        update.message.reply_text("Invalid days. It should be a positive number.")
+        return
+
+    end_date = datetime.now(BD_TZ) + timedelta(days=days)
+    end_date_str = end_date.strftime('%Y-%m-%d %H:%M:%S')
+
+    conn = get_db_connection()
+    if not conn:
+        update.message.reply_text("Bot database error. Please try again later.")
+        return
+
+    try:
+        with conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO auto_tasks (user_telegram_id, target_uid, end_date) VALUES (?, ?, ?)",
+                (user_id, uid, end_date_str)
             )
-        except Exception as e:
-            logger.error(f"Error sending error notification to admin {admin_id}: {e}")
+        update.message.reply_text(f"✅ Auto like task set for UID {uid}!\nIt will run daily until {end_date.strftime('%Y-%m-%d')}.")
+    except sqlite3.Error as e:
+        logger.error(f"Error setting auto task for {user_id} / {uid}: {e}")
+        update.message.reply_text(f"Failed to set auto task. Database error: {e}")
+    finally:
+        conn.close()
 
-# মেইন ফাংশন
+def myautos(update: Update, context: CallbackContext):
+    """Handles the /myautos command."""
+    user_id = update.effective_user.id
+    conn = get_db_connection()
+    if not conn:
+        update.message.reply_text("Bot database error. Please try again later.")
+        return
+        
+    try:
+        with conn:
+            tasks = conn.execute(
+                "SELECT target_uid, end_date FROM auto_tasks WHERE user_telegram_id = ?",
+                (user_id,)
+            ).fetchall()
+            
+            if not tasks:
+                update.message.reply_text("You have no active auto like tasks.")
+                return
+
+            now = datetime.now(BD_TZ)
+            message = "<b>Your Active Auto Like Tasks:</b>\n\n"
+            active_tasks = 0
+            
+            for task in tasks:
+                end_date = datetime.strptime(task['end_date'], '%Y-%m-%d %H:%M:%S').astimezone(BD_TZ)
+                if end_date > now:
+                    active_tasks += 1
+                    days_left = (end_date - now).days
+                    message += f"<b>UID:</b> <code>{task['target_uid']}</code>\n<b>Expires:</b> {end_date.strftime('%Y-%m-%d')} ({days_left} days left)\n\n"
+            
+            if active_tasks == 0:
+                update.message.reply_text("You have no active auto like tasks.")
+            else:
+                update.message.reply_html(message)
+
+    except sqlite3.Error as e:
+        logger.error(f"Error fetching myautos for {user_id}: {e}")
+        update.message.reply_text(f"Error fetching tasks: {e}")
+    finally:
+        conn.close()
+
+def removeauto(update: Update, context: CallbackContext):
+    """Handles the /removeauto command."""
+    user_id = update.effective_user.id
+    
+    if not context.args:
+        update.message.reply_text("Usage: /removeauto <uid>\nExample: <code>/removeauto 1234567890</code>", parse_mode=ParseMode.HTML)
+        return
+        
+    uid = context.args[0]
+    if not uid.isdigit():
+        update.message.reply_text("Invalid UID.")
+        return
+
+    conn = get_db_connection()
+    if not conn:
+        update.message.reply_text("Bot database error. Please try again later.")
+        return
+
+    try:
+        with conn:
+            cur = conn.cursor()
+            cur.execute(
+                "DELETE FROM auto_tasks WHERE user_telegram_id = ? AND target_uid = ?",
+                (user_id, uid)
+            )
+            if cur.rowcount > 0:
+                update.message.reply_text(f"✅ Auto like task for UID {uid} has been removed.")
+            else:
+                update.message.reply_text(f"No active auto like task found for UID {uid} under your account.")
+    except sqlite3.Error as e:
+        logger.error(f"Error removing auto task for {user_id} / {uid}: {e}")
+        update.message.reply_text(f"Failed to remove auto task. Database error: {e}")
+    finally:
+        conn.close()
+
+def stauto(update: Update, context: CallbackContext):
+    """Handles the /stauto (start auto) command for admins."""
+    if not is_admin(update.effective_user.id):
+        update.message.reply_text("This is an admin-only command.")
+        return
+        
+    update.message.reply_text("Starting manual run of auto-like tasks...")
+    # Run in a new thread to avoid blocking the bot
+    threading.Thread(target=run_auto_like_tasks, args=(context.bot, update.effective_user.id)).start()
+
+# --- ADMIN COMMANDS ---
+
+def manage_permission(update: Update, context: CallbackContext, perm_type, value):
+    """Helper function to add/remove permissions."""
+    if not is_admin(update.effective_user.id):
+        update.message.reply_text("This is an admin-only command.")
+        return
+        
+    if not update.message.reply_to_message:
+        update.message.reply_text("Please reply to a user's message to use this command.")
+        return
+        
+    target_user = update.message.reply_to_message.from_user
+    target_id = target_user.id
+    target_name = target_user.first_name
+
+    conn = get_db_connection()
+    if not conn:
+        update.message.reply_text("Bot database error.")
+        return
+
+    try:
+        with conn:
+            conn.execute(
+                f"INSERT INTO users (telegram_id, has_{perm_type}_permission) VALUES (?, ?) "
+                f"ON CONFLICT(telegram_id) DO UPDATE SET has_{perm_type}_permission = ?",
+                (target_id, value, value)
+            )
+        
+        action = "granted" if value else "removed"
+        update.message.reply_text(f"✅ {perm_type.capitalize()} permission {action} for {target_name} (ID: {target_id}).")
+        
+    except sqlite3.Error as e:
+        logger.error(f"Error managing permission for {target_id}: {e}")
+        update.message.reply_text(f"Database error: {e}")
+    finally:
+        conn.close()
+
+def permitlike(update: Update, context: CallbackContext):
+    manage_permission(update, context, 'like', 1)
+
+def permitauto(update: Update, context: CallbackContext):
+    manage_permission(update, context, 'auto', 1)
+
+def rmlike(update: Update, context: CallbackContext):
+    manage_permission(update, context, 'like', 0)
+
+def rmauto(update: Update, context: CallbackContext):
+    manage_permission(update, context, 'auto', 0)
+
+def setlimit(update: Update, context: CallbackContext):
+    """Sets a custom limit for a user."""
+    if not is_admin(update.effective_user.id):
+        update.message.reply_text("This is an admin-only command.")
+        return
+        
+    if len(context.args) != 3:
+        update.message.reply_text("Usage: /setlimit <telegram_id> <like|auto> <limit>")
+        return
+
+    try:
+        target_id = int(context.args[0])
+        limit_type = context.args[1].lower()
+        limit_value = int(context.args[2])
+        
+        if limit_type not in ['like', 'auto']:
+            raise ValueError("Limit type must be 'like' or 'auto'.")
+        if limit_value < 0:
+            raise ValueError("Limit must be a positive number.")
+            
+    except ValueError as e:
+        update.message.reply_text(f"Invalid input: {e}\nUsage: /setlimit <telegram_id> <like|auto> <limit>")
+        return
+
+    conn = get_db_connection()
+    if not conn:
+        update.message.reply_text("Bot database error.")
+        return
+
+    try:
+        with conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO limits (telegram_id, type, limit_value) VALUES (?, ?, ?)",
+                (target_id, limit_type, limit_value)
+            )
+        update.message.reply_text(f"✅ Custom {limit_type} limit for ID {target_id} set to {limit_value}.")
+    except sqlite3.Error as e:
+        logger.error(f"Error setting limit for {target_id}: {e}")
+        update.message.reply_text(f"Database error: {e}")
+    finally:
+        conn.close()
+
+def removelimit(update: Update, context: CallbackContext):
+    """Removes a custom limit for a user."""
+    if not is_admin(update.effective_user.id):
+        update.message.reply_text("This is an admin-only command.")
+        return
+        
+    if len(context.args) != 2:
+        update.message.reply_text("Usage: /removelimit <telegram_id> <like|auto>")
+        return
+
+    try:
+        target_id = int(context.args[0])
+        limit_type = context.args[1].lower()
+        if limit_type not in ['like', 'auto']:
+            raise ValueError
+    except ValueError:
+        update.message.reply_text("Invalid input. Usage: /removelimit <telegram_id> <like|auto>")
+        return
+
+    conn = get_db_connection()
+    if not conn:
+        update.message.reply_text("Bot database error.")
+        return
+
+    try:
+        with conn:
+            cur = conn.cursor()
+            cur.execute(
+                "DELETE FROM limits WHERE telegram_id = ? AND type = ?",
+                (target_id, limit_type)
+            )
+            if cur.rowcount > 0:
+                update.message.reply_text(f"✅ Custom {limit_type} limit for ID {target_id} removed. User will revert to default.")
+            else:
+                update.message.reply_text(f"No custom {limit_type} limit found for ID {target_id}.")
+    except sqlite3.Error as e:
+        logger.error(f"Error removing limit for {target_id}: {e}")
+        update.message.reply_text(f"Database error: {e}")
+    finally:
+        conn.close()
+        
+def viewlimits(update: Update, context: CallbackContext):
+    """Views all custom limits."""
+    if not is_admin(update.effective_user.id):
+        update.message.reply_text("This is an admin-only command.")
+        return
+
+    conn = get_db_connection()
+    if not conn:
+        update.message.reply_text("Bot database error.")
+        return
+
+    try:
+        with conn:
+            limits = conn.execute("SELECT * FROM limits").fetchall()
+            if not limits:
+                update.message.reply_text("No custom limits are set.")
+                return
+
+            message = "<b>All Custom Limits:</b>\n\n"
+            for limit in limits:
+                message += f"<b>User ID:</b> <code>{limit['telegram_id']}</code>\n<b>Type:</b> {limit['type']}\n<b>Limit:</b> {limit['limit_value']}\n\n"
+            update.message.reply_html(message)
+    except sqlite3.Error as e:
+        logger.error(f"Error viewing limits: {e}")
+        update.message.reply_text(f"Database error: {e}")
+    finally:
+        conn.close()
+
+def stats(update: Update, context: CallbackContext):
+    """Shows bot statistics."""
+    if not is_admin(update.effective_user.id):
+        update.message.reply_text("This is an admin-only command.")
+        return
+
+    conn = get_db_connection()
+    if not conn:
+        update.message.reply_text("Bot database error.")
+        return
+        
+    try:
+        with conn:
+            total_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            like_users = conn.execute("SELECT COUNT(*) FROM users WHERE has_like_permission = 1").fetchone()[0]
+            auto_users = conn.execute("SELECT COUNT(*) FROM users WHERE has_auto_permission = 1").fetchone()[0]
+            active_tasks = conn.execute("SELECT COUNT(*) FROM auto_tasks").fetchone()[0] # Note: This includes expired, we should filter
+            
+            # More accurate task count
+            now_str = datetime.now(BD_TZ).strftime('%Y-%m-%d %H:%M:%S')
+            active_tasks_filtered = conn.execute(
+                "SELECT COUNT(*) FROM auto_tasks WHERE end_date > ?", (now_str,)
+            ).fetchone()[0]
+
+            message = f"""
+<b>Bot Statistics</b>
+- <b>Total Users in DB:</b> {total_users}
+- <b>Users with Like Perms:</b> {like_users}
+- <b>Users with Auto Perms:</b> {auto_users}
+- <b>Active Auto-Like Tasks:</b> {active_tasks_filtered}
+            """
+            update.message.reply_html(message)
+            
+    except sqlite3.Error as e:
+        logger.error(f"Error getting stats: {e}")
+        update.message.reply_text(f"Database error: {e}")
+    finally:
+        conn.close()
+
+# --- SCHEDULER ---
+
+def run_auto_like_tasks(bot: 'telegram.Bot', admin_chat_id=None):
+    """Scheduled job to run all auto-like tasks."""
+    logger.info("Scheduler: Running auto-like tasks...")
+    conn = get_db_connection()
+    if not conn:
+        logger.error("Scheduler: Could not connect to DB.")
+        return
+
+    now = datetime.now(BD_TZ)
+    now_str = now.strftime('%Y-%m-%d %H:%M:%S')
+    
+    tasks_to_run = []
+    tasks_to_delete = []
+    
+    try:
+        with conn:
+            # Get all tasks
+            all_tasks = conn.execute("SELECT id, user_telegram_id, target_uid, end_date FROM auto_tasks").fetchall()
+            
+            for task in all_tasks:
+                end_date = datetime.strptime(task['end_date'], '%Y-%m-%d %H:%M:%S').astimezone(BD_TZ)
+                
+                if end_date <= now:
+                    tasks_to_delete.append(task['id'])
+                else:
+                    tasks_to_run.append(task)
+            
+            # Delete expired tasks
+            if tasks_to_delete:
+                conn.executemany("DELETE FROM auto_tasks WHERE id = ?", [(tid,) for tid in tasks_to_delete])
+                logger.info(f"Scheduler: Cleaned up {len(tasks_to_delete)} expired tasks.")
+
+    except sqlite3.Error as e:
+        logger.error(f"Scheduler: Error reading/deleting tasks: {e}")
+        if admin_chat_id:
+            bot.send_message(admin_chat_id, f"Error reading tasks from DB: {e}")
+    finally:
+        conn.close()
+
+    logger.info(f"Scheduler: Found {len(tasks_to_run)} active tasks to process.")
+    
+    success_count = 0
+    fail_count = 0
+    
+    for task in tasks_to_run:
+        uid = task['target_uid']
+        user_id = task['user_telegram_id']
+        
+        success, message = call_like_api(uid)
+        
+        if success:
+            success_count += 1
+            logger.info(f"Scheduler: Successfully sent like to UID {uid} for user {user_id}.")
+        else:
+            fail_count += 1
+            logger.warning(f"Scheduler: Failed to send like to UID {uid} for user {user_id}. Reason: {message}")
+            try:
+                # Notify the user who set the task
+                bot.send_message(
+                    chat_id=user_id,
+                    text=f"❌ Auto-like for UID <code>{uid}</code> failed.\n<b>Reason:</b> {message}",
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception as e:
+                logger.error(f"Scheduler: Failed to send error notification to user {user_id}: {e}")
+
+    logger.info(f"Scheduler: Run complete. Success: {success_count}, Fail: {fail_count}")
+    
+    if admin_chat_id:
+        bot.send_message(
+            admin_chat_id,
+            f"Manual auto-like run complete.\nSuccess: {success_count}, Fail: {fail_count}"
+        )
+
+
+# --- MAIN ---
+
 def main():
-    # আপডেটার তৈরি করুন
-    updater = Updater(BOT_TOKEN)
-    
-    # ডিসপ্যাচার পান
+    """Starts the bot."""
+    # Check for config
+    if BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN" or not ADMIN_IDS:
+        logger.critical("!!! BOT_TOKEN or ADMIN_IDS are not set in bot.py! Please fill them and restart. !!!")
+        return
+
+    # Initialize DB
+    init_db()
+
+    # Setup Bot
+    updater = Updater(BOT_TOKEN, use_context=True)
     dispatcher = updater.dispatcher
-    
-    # কমান্ড হ্যান্ডলার যোগ করুন
-    dispatcher.add_handler(CommandHandler("start", start_command))
+
+    # Setup Scheduler
+    from apscheduler.schedulers.background import BackgroundScheduler
+    scheduler = BackgroundScheduler(timezone=BD_TZ)
+    # Schedule the job to run daily at 7:00 AM Bangladesh time
+    scheduler.add_job(
+        run_auto_like_tasks,
+        'cron',
+        hour=7,
+        minute=0,
+        args=[updater.bot] # Pass the bot object to the job
+    )
+    scheduler.start()
+    logger.info("Scheduler started. Tasks will run daily at 7:00 AM (Asia/Dhaka).")
+
+    # Register Handlers
+    dispatcher.add_handler(CommandHandler("start", start))
     dispatcher.add_handler(CommandHandler("help", help_command))
-    dispatcher.add_handler(CommandHandler("like", like_command))
-    dispatcher.add_handler(CommandHandler("auto", auto_command))
-    dispatcher.add_handler(CommandHandler("myautos", myautos_command))
-    dispatcher.add_handler(CommandHandler("removeauto", removeauto_command))
-    dispatcher.add_handler(CommandHandler("stauto", stauto_command))
-    dispatcher.add_handler(CommandHandler("permitlike", permitlike_command))
-    dispatcher.add_handler(CommandHandler("permitauto", permitauto_command))
-    dispatcher.add_handler(CommandHandler("rmlike", rmlike_command))
-    dispatcher.add_handler(CommandHandler("rmauto", rmauto_command))
-    dispatcher.add_handler(CommandHandler("setlimit", setlimit_command))
-    dispatcher.add_handler(CommandHandler("removelimit", removelimit_command))
-    dispatcher.add_handler(CommandHandler("viewlimits", viewlimits_command))
-    dispatcher.add_handler(CommandHandler("stats", stats_command))
+    dispatcher.add_handler(CommandHandler("like", like))
+    dispatcher.add_handler(CommandHandler("auto", auto))
+    dispatcher.add_handler(CommandHandler("myautos", myautos))
+    dispatcher.add_handler(CommandHandler("removeauto", removeauto))
+    dispatcher.add_handler(CommandHandler("stauto", stauto))
     
-    # ইরর হ্যান্ডলার যোগ করুন
-    dispatcher.add_error_handler(error_handler)
-    
-    # সকাল ৭টায় অটো লাইক সেট করুন (বাংলাদেশ সময়)
-    job_queue = updater.job_queue
-    job_queue.run_daily(scheduled_auto_likes, time=datetime.time(7, 0, 0, tzinfo=timezone('Asia/Dhaka')))
-    
-    # বট চালু করুন
+    # Admin Handlers
+    dispatcher.add_handler(CommandHandler("permitlike", permitlike))
+    dispatcher.add_handler(CommandHandler("permitauto", permitauto))
+    dispatcher.add_handler(CommandHandler("rmlike", rmlike))
+    dispatcher.add_handler(CommandHandler("rmauto", rmauto))
+    dispatcher.add_handler(CommandHandler("setlimit", setlimit))
+    dispatcher.add_handler(CommandHandler("removelimit", removelimit))
+    dispatcher.add_handler(CommandHandler("viewlimits", viewlimits))
+    dispatcher.add_handler(CommandHandler("stats", stats))
+
+    # Start the Bot
     updater.start_polling()
-    logger.info("Bot started successfully!")
-    
-    # বট চালান
+    logger.info("Bot is polling...")
     updater.idle()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
