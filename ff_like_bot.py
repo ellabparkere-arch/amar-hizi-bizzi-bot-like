@@ -9,8 +9,8 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 # --- CONFIGURATION ---
 # !!! ⛔️ PLEASE FILL THESE VALUES ⛔️ !!!
-BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"  # Get this from BotFather on Telegram
-ADMIN_IDS = [123456789, 987654321]  # Replace with your numeric Telegram ID(s)
+BOT_TOKEN = "7954465134:AAF2LznZZuCbTJM-2mJEdU5A5K4jKf5f0_8"  # Get this from BotFather on Telegram
+ADMIN_IDS = [2098068100]  # Replace with your numeric Telegram ID(s)
 # !!! ⛔️ PLEASE FILL THESE VALUES ⛔️ !!!
 
 API_URL = "https://yunus-bhai-like-ff.vercel.app/like"
@@ -725,7 +725,7 @@ async def run_auto_like_tasks_job_manual(context: ContextTypes.DEFAULT_TYPE):
 def main():
     """Starts the bot."""
     # Check for config
-    if BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN" or not ADMIN_IDS:
+    if BOT_TOKEN == "7954465134:AAF2LznZZuCbTJM-2mJEdU5A5K4jKf5f0_8" or not ADMIN_IDS:
         logger.critical("!!! BOT_TOKEN or ADMIN_IDS are not set in bot.py! Please fill them and restart. !!!")
         return
 
@@ -771,4 +771,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
