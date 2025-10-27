@@ -6,8 +6,20 @@ import requests
 import threading
 from datetime import datetime, timezone, timedelta
 import pytz
-from telegram import Update, ParseMode
-from telegram.ext import Updater, CommandHandler, CallbackContext, MessageHandler, Filters
+
+# Try to import for v20.x, fallback to v13.x
+try:
+    # For python-telegram-bot v20.x
+    from telegram import Update
+    from telegram.constants import ParseMode
+    from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+    USE_V20 = True
+except ImportError:
+    # For python-telegram-bot v13.x
+    from telegram import Update, ParseMode
+    from telegram.ext import Updater, CommandHandler, CallbackContext, MessageHandler, Filters
+    USE_V20 = False
+
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -256,10 +268,10 @@ scheduler.add_job(run_all_active_autos_once, CronTrigger(hour=7, minute=0, timez
 scheduler.start()
 
 # ---------------- Bot Command Handlers ----------------
-def start(update: Update, context: CallbackContext):
+def start(update: Update, context):
     update.message.reply_text("Free Fire Auto Like Bot ready. Use /help to see commands.")
 
-def help_cmd(update: Update, context: CallbackContext):
+def help_cmd(update: Update, context):
     text = (
         "*Free Fire Auto Like Bot*\n\n"
         "/like <uid> - Send like (requires permission)\n"
@@ -285,10 +297,10 @@ def help_cmd(update: Update, context: CallbackContext):
     )
     update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
-def like_cmd(update: Update, context: CallbackContext):
+def like_cmd(update: Update, context):
     user = update.effective_user
     ensure_user(user.id)
-    args = context.args
+    args = context.args if USE_V20 else context.args
     if len(args) != 1:
         update.message.reply_text("Usage: /like <uid>")
         return
@@ -307,10 +319,10 @@ def like_cmd(update: Update, context: CallbackContext):
         update.message.reply_text(f"❌ Failed to send like to UID `{uid}`\nError: {resp}", parse_mode=ParseMode.MARKDOWN)
         log_event("ERROR", f"/like failed by {user.id} for uid={uid}: {resp}")
 
-def auto_cmd(update: Update, context: CallbackContext):
+def auto_cmd(update: Update, context):
     user = update.effective_user
     ensure_user(user.id)
-    args = context.args
+    args = context.args if USE_V20 else context.args
     if len(args) != 2:
         update.message.reply_text("Usage: /auto <uid> <days>")
         return
@@ -353,7 +365,7 @@ def auto_cmd(update: Update, context: CallbackContext):
         parse_mode=ParseMode.MARKDOWN
     )
 
-def myautos_cmd(update: Update, context: CallbackContext):
+def myautos_cmd(update: Update, context):
     user = update.effective_user
     ensure_user(user.id)
     
@@ -387,9 +399,9 @@ def myautos_cmd(update: Update, context: CallbackContext):
     
     update.message.reply_text("\n\n".join(msg_lines), parse_mode=ParseMode.MARKDOWN)
 
-def removeauto_cmd(update: Update, context: CallbackContext):
+def removeauto_cmd(update: Update, context):
     user = update.effective_user
-    args = context.args
+    args = context.args if USE_V20 else context.args
     if len(args) != 1:
         update.message.reply_text("Usage: /removeauto <uid>")
         return
@@ -410,7 +422,7 @@ def removeauto_cmd(update: Update, context: CallbackContext):
     else:
         update.message.reply_text("❌ No matching task found or you don't have permission to remove it.")
 
-def stauto_cmd(update: Update, context: CallbackContext):
+def stauto_cmd(update: Update, context):
     user = update.effective_user
     if not is_admin(user.id):
         update.message.reply_text("❌ Only admins can manually start auto-run.")
@@ -432,7 +444,7 @@ def stauto_cmd(update: Update, context: CallbackContext):
     update.message.reply_text("\n".join(lines) + summary)
 
 # Permission admin commands (reply based)
-def permitlike_cmd(update: Update, context: CallbackContext):
+def permitlike_cmd(update: Update, context):
     if not is_admin(update.effective_user.id):
         update.message.reply_text("❌ Only admins may use this.")
         return
@@ -451,7 +463,7 @@ def permitlike_cmd(update: Update, context: CallbackContext):
     
     update.message.reply_text(f"✅ Granted like permission to {target.full_name} ({target.id}).")
 
-def permitauto_cmd(update: Update, context: CallbackContext):
+def permitauto_cmd(update: Update, context):
     if not is_admin(update.effective_user.id):
         update.message.reply_text("❌ Only admins may use this.")
         return
@@ -470,7 +482,7 @@ def permitauto_cmd(update: Update, context: CallbackContext):
     
     update.message.reply_text(f"✅ Granted auto permission to {target.full_name} ({target.id}).")
 
-def rmlike_cmd(update: Update, context: CallbackContext):
+def rmlike_cmd(update: Update, context):
     if not is_admin(update.effective_user.id):
         update.message.reply_text("❌ Only admins may use this.")
         return
@@ -489,7 +501,7 @@ def rmlike_cmd(update: Update, context: CallbackContext):
     
     update.message.reply_text(f"✅ Removed like permission from {target.full_name} ({target.id}).")
 
-def rmauto_cmd(update: Update, context: CallbackContext):
+def rmauto_cmd(update: Update, context):
     if not is_admin(update.effective_user.id):
         update.message.reply_text("❌ Only admins may use this.")
         return
@@ -508,12 +520,12 @@ def rmauto_cmd(update: Update, context: CallbackContext):
     
     update.message.reply_text(f"✅ Removed auto permission from {target.full_name} ({target.id}).")
 
-def setlimit_cmd(update: Update, context: CallbackContext):
+def setlimit_cmd(update: Update, context):
     if not is_admin(update.effective_user.id):
         update.message.reply_text("❌ Only admins may use this.")
         return
     
-    args = context.args
+    args = context.args if USE_V20 else context.args
     if len(args) != 3:
         update.message.reply_text("Usage: /setlimit <telegram_id> <like|auto> <limit>")
         return
@@ -543,12 +555,12 @@ def setlimit_cmd(update: Update, context: CallbackContext):
     
     update.message.reply_text(f"✅ Set {typ} limit for {tid} to {limit}.")
 
-def removelimit_cmd(update: Update, context: CallbackContext):
+def removelimit_cmd(update: Update, context):
     if not is_admin(update.effective_user.id):
         update.message.reply_text("❌ Only admins may use this.")
         return
     
-    args = context.args
+    args = context.args if USE_V20 else context.args
     if len(args) != 2:
         update.message.reply_text("Usage: /removelimit <telegram_id> <like|auto>")
         return
@@ -575,7 +587,7 @@ def removelimit_cmd(update: Update, context: CallbackContext):
     
     update.message.reply_text(f"✅ Removed custom {typ} limit for {tid} (back to default).")
 
-def viewlimits_cmd(update: Update, context: CallbackContext):
+def viewlimits_cmd(update: Update, context):
     if not is_admin(update.effective_user.id):
         update.message.reply_text("❌ Only admins may use this.")
         return
@@ -600,7 +612,7 @@ def viewlimits_cmd(update: Update, context: CallbackContext):
     
     update.message.reply_text("\n\n".join(lines) if lines else "No user limits found.")
 
-def stats_cmd(update: Update, context: CallbackContext):
+def stats_cmd(update: Update, context):
     if not is_admin(update.effective_user.id):
         update.message.reply_text("❌ Only admins may use this.")
         return
@@ -633,7 +645,7 @@ def stats_cmd(update: Update, context: CallbackContext):
     update.message.reply_text(stats_text)
 
 # Generic error handler
-def error_handler(update: Update, context: CallbackContext):
+def error_handler(update, context):
     logger.error(f"Update {update} caused error {context.error}")
     if update and update.effective_message:
         update.effective_message.reply_text("❌ An error occurred while processing your command. Please try again later.")
@@ -644,42 +656,74 @@ def main():
         logger.error("BOT_TOKEN not set in environment variables")
         return
     
-    updater = Updater(BOT_TOKEN, use_context=True)
-    dp = updater.dispatcher
+    if USE_V20:
+        # For v20.x
+        application = Application.builder().token(BOT_TOKEN).build()
+        
+        # Command handlers
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("help", help_cmd))
+        application.add_handler(CommandHandler("like", like_cmd))
+        application.add_handler(CommandHandler("auto", auto_cmd))
+        application.add_handler(CommandHandler("myautos", myautos_cmd))
+        application.add_handler(CommandHandler("removeauto", removeauto_cmd))
+        application.add_handler(CommandHandler("stauto", stauto_cmd))
 
-    # Command handlers
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CommandHandler("help", help_cmd))
-    dp.add_handler(CommandHandler("like", like_cmd))
-    dp.add_handler(CommandHandler("auto", auto_cmd))
-    dp.add_handler(CommandHandler("myautos", myautos_cmd))
-    dp.add_handler(CommandHandler("removeauto", removeauto_cmd))
-    dp.add_handler(CommandHandler("stauto", stauto_cmd))
+        # Admin permission commands
+        application.add_handler(CommandHandler("permitlike", permitlike_cmd))
+        application.add_handler(CommandHandler("permitauto", permitauto_cmd))
+        application.add_handler(CommandHandler("rmlike", rmlike_cmd))
+        application.add_handler(CommandHandler("rmauto", rmauto_cmd))
+        
+        # Admin limit commands
+        application.add_handler(CommandHandler("setlimit", setlimit_cmd))
+        application.add_handler(CommandHandler("removelimit", removelimit_cmd))
+        application.add_handler(CommandHandler("viewlimits", viewlimits_cmd))
+        application.add_handler(CommandHandler("stats", stats_cmd))
 
-    # Admin permission commands
-    dp.add_handler(CommandHandler("permitlike", permitlike_cmd))
-    dp.add_handler(CommandHandler("permitauto", permitauto_cmd))
-    dp.add_handler(CommandHandler("rmlike", rmlike_cmd))
-    dp.add_handler(CommandHandler("rmauto", rmauto_cmd))
-    
-    # Admin limit commands
-    dp.add_handler(CommandHandler("setlimit", setlimit_cmd))
-    dp.add_handler(CommandHandler("removelimit", removelimit_cmd))
-    dp.add_handler(CommandHandler("viewlimits", viewlimits_cmd))
-    dp.add_handler(CommandHandler("stats", stats_cmd))
+        # Error handler
+        application.add_error_handler(error_handler)
 
-    # Error handler
-    dp.add_error_handler(error_handler)
+        logger.info("Starting bot...")
+        application.run_polling()
+    else:
+        # For v13.x
+        updater = Updater(BOT_TOKEN, use_context=True)
+        dp = updater.dispatcher
 
-    logger.info("Starting bot...")
-    updater.start_polling()
-    
-    try:
-        updater.idle()
-    finally:
-        scheduler.shutdown()
-        db.close()
-        logger.info("Bot stopped")
+        # Command handlers
+        dp.add_handler(CommandHandler("start", start))
+        dp.add_handler(CommandHandler("help", help_cmd))
+        dp.add_handler(CommandHandler("like", like_cmd))
+        dp.add_handler(CommandHandler("auto", auto_cmd))
+        dp.add_handler(CommandHandler("myautos", myautos_cmd))
+        dp.add_handler(CommandHandler("removeauto", removeauto_cmd))
+        dp.add_handler(CommandHandler("stauto", stauto_cmd))
+
+        # Admin permission commands
+        dp.add_handler(CommandHandler("permitlike", permitlike_cmd))
+        dp.add_handler(CommandHandler("permitauto", permitauto_cmd))
+        dp.add_handler(CommandHandler("rmlike", rmlike_cmd))
+        dp.add_handler(CommandHandler("rmauto", rmauto_cmd))
+        
+        # Admin limit commands
+        dp.add_handler(CommandHandler("setlimit", setlimit_cmd))
+        dp.add_handler(CommandHandler("removelimit", removelimit_cmd))
+        dp.add_handler(CommandHandler("viewlimits", viewlimits_cmd))
+        dp.add_handler(CommandHandler("stats", stats_cmd))
+
+        # Error handler
+        dp.add_error_handler(error_handler)
+
+        logger.info("Starting bot...")
+        updater.start_polling()
+        
+        try:
+            updater.idle()
+        finally:
+            scheduler.shutdown()
+            db.close()
+            logger.info("Bot stopped")
 
 if __name__ == "__main__":
     main()
